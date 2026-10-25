@@ -2,3 +2,5 @@ APK/
 __pycache__/
 *.pyc
 .bbl_skip_cache.json
+skipobj-go/*.exe
+skipobj-go/*.exe~

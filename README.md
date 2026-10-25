@@ -8,7 +8,8 @@ Bambu Studio 凭证),已在真实 A1 + 正在进行的打印任务上全链路�
 
 | 文件 | 说明 |
 |---|---|
-| `bambu_skip_objects.py` | PC 工具(GUI + CLI,依赖 `paho-mqtt`、`pycryptodome`) |
+| `skipobj-go/` | **Go 重写版(推荐)**:`build.bat` 构建双 exe,零运行时依赖 |
+| `bambu_skip_objects.py` | Python 原型(功能相同,依赖 `paho-mqtt`、`pycryptodome`) |
 | `docs/reverse-notes.md` | 完整逆向记录(含实测证据) |
 | `research/decompiled/` | 逆向证据:关键类反编译源码摘录(含角色索引) |
 | `APK/app_zh_release.apk` | 分析对象(179MB,不入库,见 `.gitignore`;Virbox 加壳的 RN 应用,协议在 Java 层完整还原) |
