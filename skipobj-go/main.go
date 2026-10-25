@@ -4,11 +4,14 @@ package main
 // 协议逆向自 Bambu Handy,证据链见 docs/reverse-notes.md
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 const Version = "2.0"
@@ -16,6 +19,12 @@ const Version = "2.0"
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--cli" || os.Args[1] == "cli") {
 		runCLI(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--monitor" {
+		fs := flag.NewFlagSet("monitor", flag.ExitOnError)
+		_ = fs.Parse(os.Args[2:])
+		runMonitor(fs.Arg(0))
 		return
 	}
 	web := flag.Bool("web", false, "使用本机 Web 界面(默认原生窗口)")
@@ -37,6 +46,7 @@ func runCLI(args []string) {
 	sn := fs.String("sn", "", "打印机序列号(云端多台时必填)")
 	ids := fs.String("ids", "", "要跳过的对象 ID,逗号分隔")
 	testPayload := fs.String("test-payload", "", "调试:对 175 依次测试 int/string/legacy 三种格式")
+	monitor := fs.String("monitor", "", "监听模式:订阅指定 SN 的 report+request 全部消息")
 	legacy := fs.Bool("legacy", false, "旧协议(Studio 格式)")
 	_ = fs.Parse(args)
 
@@ -148,6 +158,10 @@ func runCLI(args []string) {
 		p.Disconnect()
 		return
 	}
+	if *monitor != "" {
+		runMonitor(*monitor)
+		return
+	}
 
 	if len(pending) > 0 {
 		sentFlag := false
@@ -249,4 +263,43 @@ func runPayloadTest(p *Printer) {
 	}
 	_, r = p.Report()
 	fmt.Println("[after] skip_objects=" + asString(r["skip_objects"]) + " 状态=" + stateText(asString(r["gcode_state"])) + " 层=" + orDash(r["layer_num"]))
+}
+
+
+// runMonitor 监听模式:同时订阅 report(打印机→)与 request(→打印机)两个方向。
+// 用途:在 Handy 上执行跳过时,抓取 Handy 发送的真实命令 JSON 做协议对比。
+func runMonitor(sn string) {
+	creds, err := LoadCreds()
+	if err != nil {
+		fmt.Println("[!]", err)
+		os.Exit(1)
+	}
+	fmt.Println("[*] 监听 " + creds.MQTTHost() + "(云端 " + creds.Region + ")SN=" + sn)
+	fmt.Println("[*] 请现在在手机 Handy 上执行跳过操作,所有消息将被记录…")
+	c := mqtt.NewClient(mqtt.NewClientOptions().
+		AddBroker("tcps://"+creds.MQTTHost()+":8883").
+		SetClientID(newUUID()).
+		SetUsername("u_"+creds.UserID).
+		SetPassword(creds.Token).
+		SetTLSConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetDefaultPublishHandler(func(_ mqtt.Client, m mqtt.Message) {
+			ts := time.Now().Format("15:04:05.000")
+			payload := string(m.Payload())
+			if len(payload) > 1200 {
+				payload = payload[:1200] + "…(截断)"
+			}
+			fmt.Printf("[%s] %s\n    %s\n", ts, m.Topic(), payload)
+		}))
+	tok := c.Connect()
+	if !tok.WaitTimeout(20*time.Second) || tok.Error() != nil {
+		fmt.Println("[!] 连接失败")
+		os.Exit(1)
+	}
+	for _, topic := range []string{"device/" + sn + "/report", "device/" + sn + "/request"} {
+		t := c.Subscribe(topic, 0, nil)
+		t.WaitTimeout(5 * time.Second)
+		fmt.Println("[+] 订阅 " + topic)
+	}
+	fmt.Println("[*] 监听中,Ctrl+C 退出")
+	select {}
 }
