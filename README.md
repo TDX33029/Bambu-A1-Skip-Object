@@ -16,6 +16,11 @@ Bambu Studio 凭证),已在真实 A1 + 正在进行的打印任务上全链路�
 
 ## 使用
 
+**Go 版(推荐)**:运行 `skipobj-go/BambuSkipObjects.exe`(双击,自动打开浏览器界面),
+或 `cd skipobj-go && build.bat` 自行构建。CLI:`bbl-skip-cli.exe --cli --sn <SN> --ids 197,175`。
+
+Python 版:
+
 ```bash
 pip install paho-mqtt pycryptodome
 python bambu_skip_objects.py
