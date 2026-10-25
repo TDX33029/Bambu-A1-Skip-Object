@@ -8,7 +8,7 @@ Bambu Studio 凭证),已在真实 A1 + 正在进行的打印任务上全链路�
 
 | 文件 | 说明 |
 |---|---|
-| `skipobj-go/` | **Go 重写版(推荐)**:`build.bat` 构建双 exe,零运行时依赖 |
+| `skipobj-go/` | **Go 重写版(推荐)**:`build.bat` 构建双 exe,零运行时依赖;原生窗口界面 |
 | `bambu_skip_objects.py` | Python 原型(功能相同,依赖 `paho-mqtt`、`pycryptodome`) |
 | `docs/reverse-notes.md` | 完整逆向记录(含实测证据) |
 | `research/decompiled/` | 逆向证据:关键类反编译源码摘录(含角色索引) |

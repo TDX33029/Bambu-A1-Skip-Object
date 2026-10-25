@@ -18,10 +18,15 @@ func main() {
 		runCLI(os.Args[2:])
 		return
 	}
-	addr := flag.String("addr", "127.0.0.1:8974", "本地 UI 监听地址")
-	noOpen := flag.Bool("no-browser", false, "不自动打开浏览器")
+	web := flag.Bool("web", false, "使用本机 Web 界面(默认原生窗口)")
+	addr := flag.String("addr", "127.0.0.1:8974", "本地 UI 监听地址(--web 时)")
+	noOpen := flag.Bool("no-browser", false, "不自动打开浏览器(--web 时)")
 	flag.Parse()
-	RunWebUI(*addr, !*noOpen)
+	if *web {
+		RunWebUI(*addr, !*noOpen)
+		return
+	}
+	runUI()
 }
 
 func runCLI(args []string) {
