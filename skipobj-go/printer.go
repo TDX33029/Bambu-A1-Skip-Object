@@ -247,8 +247,10 @@ func (p *Printer) publishPrint(category string, body map[string]any) error {
 }
 
 // SkipObjects 跳过指定零件。
-// 新协议(Handy):{"print":{"command":"skip_objects","obj_list":[...],...}}
-// 旧协议(Studio):{"print":{"skip_objects":"1,2",...}}
+// 实测(2026-10,A1):固件仅响应旧协议 {"print":{"skip_objects":"1,2"}}(Studio 格式);
+// Handy 云端新协议 {"command":"skip_objects","obj_list":[...]} 在 LAN/云端 MQTT 上均无响应。
+// 策略:legacy=true 直接旧协议;否则先发新协议,5 秒内打印机未回报 skip_objects 包含目标,
+// 自动降级重发旧协议。
 func (p *Printer) SkipObjects(ids []int, legacy bool) error {
 	clean := ids[:0:0]
 	seen := map[int]bool{}
@@ -268,7 +270,56 @@ func (p *Printer) SkipObjects(ids []int, legacy bool) error {
 		}
 		return p.publishPrint("print", map[string]any{"skip_objects": strings.Join(ss, ",")})
 	}
-	return p.publishPrint("print", map[string]any{"command": "skip_objects", "obj_list": clean})
+	if err := p.publishPrint("print", map[string]any{
+		"command": "skip_objects", "obj_list": clean}); err != nil {
+		return err
+	}
+	go func() {
+		want := map[int]bool{}
+		for _, id := range clean {
+			want[id] = true
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(1 * time.Second)
+			if _, r := p.Report(); r != nil {
+				got := parseSkipObjects(asString(r["skip_objects"]))
+				covered := true
+				for id := range want {
+					if !got[id] {
+						covered = false
+						break
+					}
+				}
+				if covered {
+					p.logf("[+] 打印机已确认跳过: %v", clean)
+					return
+				}
+			}
+		}
+		p.logf("[!] 新协议无响应(%v),自动改用旧协议(Studio 格式)重发…", clean)
+		ss := make([]string, len(clean))
+		for i, id := range clean {
+			ss[i] = strconv.Itoa(id)
+		}
+		if err := p.publishPrint("print", map[string]any{
+			"skip_objects": strings.Join(ss, ",")}); err == nil {
+			p.logf("[+] 旧协议已发送: %v(以 report 的 skip_objects 回报为准)", clean)
+		}
+	}()
+	return nil
+}
+
+// parseSkipObjects 解析 report 的 skip_objects(逗号分隔字符串)为 id 集合
+func parseSkipObjects(s string) map[int]bool {
+	out := map[int]bool{}
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if n, err := strconv.Atoi(tok); err == nil && n > 0 {
+			out[n] = true
+		}
+	}
+	return out
 }
 
 // RequestPush 请求打印机推送完整 report(社区通用 pushall 命令)

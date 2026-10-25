@@ -55,7 +55,8 @@ python bambu_skip_objects.py --cli --lan --ip 192.168.1.100 --code 12345678 --id
            "timestamp": <ms>, "obj_list": [<identify_id>...]}}
 ```
 
-- **旧协议备选**:`{"print": {"sequence_id": "…", "skip_objects": "1,2"}}`
+- **旧协议(实测 A1 固件仅认此格式,工具发送后 5 秒无确认会自动降级到此)**:
+  `{"print": {"sequence_id": "…", "skip_objects": "1,2"}}`
 - **对象 ID**:identify_id,与切片 obj_id 同源;来源三选一:
   云端 `{api}/v1/iot-service/api/user/task/{task_id}`(Handy 同源接口)、
   3mf 的 `Metadata/slice_info.config`、report 的 `skip_objects` 回报

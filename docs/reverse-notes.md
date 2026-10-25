@@ -242,6 +242,22 @@ PC 工具已实现同等交互:俯视图 Canvas 展示(pick 遮罩可点击 / �
 点击取像素(`tk.PhotoImage.get`)反解 ID → 列表勾选联动 + 圈选标记;
 云端任务自动下载 pick/top 图,本地 3mf 直接读 `Metadata/pick_N.png`。
 
+## 5e. 跳过命令格式的关键实测结论(2026-10)
+
+对 A1(当前固件)在云端 MQTT 上实测,同一零件 175 三种格式:
+
+| 格式 | payload | 打印机反应 |
+|---|---|---|
+| Handy 新协议(int) | `{"print":{"command":"skip_objects","obj_list":[175]}}` | **无响应**(report 的 skip_objects 不变) |
+| Handy 新协议(string) | `obj_list:["175"]` | **无响应** |
+| **Studio 旧协议** | `{"print":{"skip_objects":"175"}}` | **✓ 立即接受**,skip_objects=175 持续回报 |
+
+结论:**A1 固件只认旧协议**;新协议 `command:skip_objects` 在 LAN/云端 MQTT 直连上均无效
+(该协议可能由云端服务转译,或仅特定固件支持)。工具的 SkipObjects 已实现**自动降级**:
+先发新协议,5 秒内打印机未回报包含目标的 skip_objects 即自动补发旧协议,三端(GUI/CLI/Web)共享。
+另:打印机对无效 ID 会短暂回显后清理;有效跳过的回报也会随后续打印上下文变化而清除,
+发送瞬间的回显即代表接受。
+
 ## 6. 已知环境问题:代理软件(Fake-IP)会卡死 MQTT 连接
 
 **现象**:GUI 卡在「正在连接 cn.mqtt.bambulab.com:8883 …」。

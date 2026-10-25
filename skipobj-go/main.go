@@ -36,6 +36,7 @@ func runCLI(args []string) {
 	code := fs.String("code", "", "设备访问码 8 位(局域网)")
 	sn := fs.String("sn", "", "打印机序列号(云端多台时必填)")
 	ids := fs.String("ids", "", "要跳过的对象 ID,逗号分隔")
+	testPayload := fs.String("test-payload", "", "调试:对 175 依次测试 int/string/legacy 三种格式")
 	legacy := fs.Bool("legacy", false, "旧协议(Studio 格式)")
 	_ = fs.Parse(args)
 
@@ -142,6 +143,12 @@ func runCLI(args []string) {
 		}
 	}
 
+	if *testPayload != "" {
+		runPayloadTest(p)
+		p.Disconnect()
+		return
+	}
+
 	if len(pending) > 0 {
 		sentFlag := false
 		deadline = time.Now().Add(30 * time.Second)
@@ -168,7 +175,7 @@ func runCLI(args []string) {
 		if !sentFlag {
 			fmt.Println("[!] 30 秒内未能发送(打印机未处于打印中?)")
 		} else {
-			time.Sleep(3 * time.Second)
+			time.Sleep(9 * time.Second)   // 等待自动降级(5s)完成后再确认
 			if _, rp := p.Report(); rp != nil {
 				fmt.Printf("[*] 打印机当前已跳过: %v\n", orDash(rp["skip_objects"]))
 			}
@@ -200,4 +207,46 @@ func orDash(v any) string {
 		return fmt.Sprintf("%v", int64(f))
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+
+// runPayloadTest 调试:同一零件(175)用三种 payload 格式发送,观察 report 的 skip_objects 反应。
+func runPayloadTest(p *Printer) {
+	_, r := p.Report()
+	before := asString(r["skip_objects"])
+	fmt.Println("[before] skip_objects=" + before + " 状态=" + stateText(asString(r["gcode_state"])) + " 层=" + orDash(r["layer_num"]))
+
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{"A 新协议 obj_list 整数", map[string]any{"command": "skip_objects", "obj_list": []int{175}}},
+		{"B 新协议 obj_list 字符串", map[string]any{"command": "skip_objects", "obj_list": []string{"175"}}},
+		{"C 旧协议(Studio 字符串)", map[string]any{"skip_objects": "175"}},
+	}
+	for _, tt := range tests {
+		fmt.Println("=== 发送 " + tt.name)
+		if err := p.publishPrint("print", tt.body); err != nil {
+			fmt.Println("    发送失败: " + err.Error())
+			continue
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		last := before
+		changed := ""
+		for time.Now().Before(deadline) {
+			p.RequestPush()
+			time.Sleep(1500 * time.Millisecond)
+			if _, rr := p.Report(); rr != nil {
+				cur := asString(rr["skip_objects"])
+				if cur != last {
+					fmt.Println("    [变化] skip_objects=" + cur + " 层=" + orDash(rr["layer_num"]) + " 状态=" + stateText(asString(rr["gcode_state"])))
+					last = cur
+					changed = cur
+				}
+			}
+		}
+		fmt.Println("    [结果] " + tt.name + " -> skip_objects=" + changed)
+	}
+	_, r = p.Report()
+	fmt.Println("[after] skip_objects=" + asString(r["skip_objects"]) + " 状态=" + stateText(asString(r["gcode_state"])) + " 层=" + orDash(r["layer_num"]))
 }
