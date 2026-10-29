@@ -30,14 +30,14 @@ type SkipObject struct {
 }
 
 type Plate struct {
-	Index    int          `json:"index"`
-	Name     string       `json:"name"`
-	Source   string       `json:"source"` // cloud | 3mf
-	Objects  []SkipObject `json:"objects"`
-	PickPNG  []byte       `json:"-"`
-	TopPNG   []byte       `json:"-"`
-	HasPick  bool         `json:"has_pick"`
-	HasTop   bool         `json:"has_top"`
+	Index   int          `json:"index"`
+	Name    string       `json:"name"`
+	Source  string       `json:"source"` // cloud | 3mf
+	Objects []SkipObject `json:"objects"`
+	PickPNG []byte       `json:"-"`
+	TopPNG  []byte       `json:"-"`
+	HasPick bool         `json:"has_pick"`
+	HasTop  bool         `json:"has_top"`
 }
 
 // ---- 云端任务 ----
@@ -217,7 +217,10 @@ func Parse3MF(path string) ([]Plate, error) {
 				Skipped: strings.EqualFold(o.Skipped, "true"),
 			})
 		}
-		for _, pair := range []struct{ pre string; dst *[]byte }{
+		for _, pair := range []struct {
+			pre string
+			dst *[]byte
+		}{
 			{"pick", &pl.PickPNG}, {"top", &pl.TopPNG},
 		} {
 			for _, cand := range []string{
