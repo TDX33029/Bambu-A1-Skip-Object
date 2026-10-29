@@ -209,7 +209,7 @@ Authorization: Bearer <token> ; 需要移动端 User-Agent(否则 403)
 | 云端 MQTT 连接(cn.mqtt.bambulab.com:8883,u_\<uid\>/token) | CONNECTED |
 | `device/<SN>/report` 订阅 + pushall | 收到完整 report:RUNNING、task_id=123456789、层 69/222、任务《示例任务》 |
 | 云端 API `…/v1/iot-service/api/user/task/123456789` | 200,`context.plates[0].objects = [{identify_id:'197', name:'零件A.STL'}, {identify_id:'175', name:'零件B.STL'}]` |
-| 发送旧协议 `{"print":{"skip_objects":"999999"}}`(故意不存在的 ID,安全验证) | **打印机接受并在 report 回显 `skip_objects:999999`**,随后自行清理恢复;打印继续正常 —— 命令通道确认有效 |
+| 发送旧协议 `{"print":{"skip_objects":"999999"}}`(故意不存在的 ID) | report 回显该命令并附 `err_code=84033543` + HMS `0500050000010007`;旧版把回显误当成“接受”(见 §5e 修正) |
 | 云端 report 形态 | 分段推送(不同报文携带不同字段),客户端需按字段合并 |
 
 注意:
@@ -242,21 +242,70 @@ PC 工具已实现同等交互:俯视图 Canvas 展示(pick 遮罩可点击 / �
 点击取像素(`tk.PhotoImage.get`)反解 ID → 列表勾选联动 + 圈选标记;
 云端任务自动下载 pick/top 图,本地 3mf 直接读 `Metadata/pick_N.png`。
 
-## 5e. 跳过命令格式的关键实测结论(2026-10)
+## 5e. 跳过命令与固件签名要求(2026-10 修正)
 
-对 A1(当前固件)在云端 MQTT 上实测,同一零件 175 三种格式:
+A1 当前固件对 `print` 分类的控制命令做 **MQTT 命令签名校验**。未签名时打印机在 report 中
+回显原命令并附 `err_code=84033543`(0x05024007),同时上报 HMS `0500050000010007`
+「MQTT 命令校验失败,请更新 Studio(含网络插件)或 Handy 至最新版本」。
 
-| 格式 | payload | 打印机反应 |
-|---|---|---|
-| Handy 新协议(int) | `{"print":{"command":"skip_objects","obj_list":[175]}}` | **无响应**(report 的 skip_objects 不变) |
-| Handy 新协议(string) | `obj_list:["175"]` | **无响应** |
-| **Studio 旧协议** | `{"print":{"skip_objects":"175"}}` | **✓ 立即接受**,skip_objects=175 持续回报 |
+此前把这条回显当成状态合并,误判为「Studio 旧协议被接受」。修正后的实测(同一固件):
 
-结论:**A1 固件只认旧协议**;新协议 `command:skip_objects` 在 LAN/云端 MQTT 直连上均无效
-(该协议可能由云端服务转译,或仅特定固件支持)。工具的 SkipObjects 已实现**自动降级**:
-先发新协议,5 秒内打印机未回报包含目标的 skip_objects 即自动补发旧协议,三端(GUI/CLI/Web)共享。
-另:打印机对无效 ID 会短暂回显后清理;有效跳过的回报也会随后续打印上下文变化而清除,
-发送瞬间的回显即代表接受。
+| 命令 | 结果 |
+|---|---|
+| 未签名 `skip_objects`(任意 obj_list 形式) | 84033543 拒绝 |
+| 未签名 `pause` | 84033543 拒绝 |
+| 已安装证书 + 签名 `pause` | 通过签名校验,返回业务错误 84033545(AMS 未标定) |
+
+结论:命令格式不是关键,签名才是。工具现在只发送 Handy 新协议
+`{"print":{"command":"skip_objects","obj_list":[int]}}`,并在发送前自动完成证书申请与安装;
+若仍收到 84033543,会强制重装证书后重试一次。
+
+## 5f. 云端 App 证书与命令签名(逆向 + 实测)
+
+### 证书申请
+
+`GET {api}/v1/iot-service/api/user/applications/{appKey}/cert?aes256={wrapped}`
+
+- 临时 AES:32 字节密钥 + 12 字节 IV;GCM 输出 `IV||ciphertext||tag`
+- `appKey` 路径参数:`URL-safe base64(带 = 补齐)` 的
+  `AES-GCM("GLOF3813734089-" + af70cf3b000006c7d872272593fe)`
+- `aes256` 查询参数:`URL-safe base64(带 = 补齐)` 的
+  `RSA-PKCS1v15(APK 内置证书公钥, AES 密钥)`
+- 内置包装证书:`CN=service.bambulab.com`(issuer `application_root.bambulab.com`),
+  PEM 硬编码在 `IotCertManager.exportWrappedAesKey`
+- 请求头与 Handy 4.3.0 一致:`User-Agent: Handy/4.3.0`、`X-BBL-Client-Name: BambuHandy`、
+  `X-BBL-Client-Version: 4.3.0` 等
+- 响应:`{code, cert(3 段证书链 PEM), key(base64 AES-GCM 私钥 PKCS8), crl(PEM 数组)}`;
+  `key` 解密得到 `-----BEGIN PRIVATE KEY-----`
+
+**踩坑**:两处 base64 都必须保留 `=` 补齐。缺少 padding 时服务端统一返回
+`code=101`「该软件已过期失效,请下载最新版本」,与真实版本问题无法区分,曾误判为 App Key 过期。
+
+`cert_id` 由证书自身推导:`CN=` + issuer CN + `:` + 序列号大写十六进制(无前导 0),
+本机实测为 `CN=GLOF3813734089.bambulab.com:95554D66B3D9912FDCAD7EA8E1B8FD15`。
+
+### 安装证书(security 分类,不签名)
+
+```json
+{"security":{"sequence_id":"2001","timestamp":<ms>,"command":"app_cert_install",
+             "app_cert":"<证书链 PEM>","crl":"<CRL PEM 用换行连接>"}}
+```
+
+打印机通常不回应答;安装一次后,同 cert_id 的签名命令即可通过校验。
+
+### 命令签名
+
+- 签名内容:根对象(含 `user_id`、分类对象及 `sequence_id/timestamp/...`)且**不含 header**
+  的 canonical JSON:所有对象键升序、紧凑分隔符、按 org.json 规则转义
+- 算法:RSA-PKCS1v15 + SHA-256
+- header 附在根对象末尾:
+
+```json
+{"header":{"cert_id":"CN=...:<serial>","payload_len":<签名字节数>,
+           "sign_alg":"RSA_SHA256","sign_string":"<标准 base64 签名>","sign_ver":"v1.0"}}
+```
+
+实现:`skipobj-go/sign.go`(取证/解密/签名)、`skipobj-go/printer.go`(组包/安装/发送与重装重试)。
 
 ## 6. 已知环境问题:代理软件(Fake-IP)会卡死 MQTT 连接
 
