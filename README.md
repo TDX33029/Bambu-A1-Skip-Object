@@ -86,10 +86,14 @@ python bambu_skip_objects.py --cli --lan --ip 192.168.1.100 --code 12345678 --id
 
 ## 常见问题
 
-**卡在「正在连接 cn.mqtt.bambulab.com:8883 …」?**
-代理软件(Clash/Mihomo 的 Fake-IP 模式)把 MQTT 长连接转发到了境外节点。
-工具会自动检测并在日志中警告(显示 `198.18.x.x`)。解决:把 `*.bambulab.com`
-加入代理**直连(DIRECT)规则**,或临时关代理,或切局域网模式(见下)。
+**卡在「正在连接 cn.mqtt.bambulab.com:8883 …」/ 云端连接失败?**
+代理软件(Clash/Mihomo 的 Fake-IP 模式)会把 `cn.mqtt.bambulab.com` 解析成
+`198.18.x.x`,并把 MQTT 长连接转发到境外节点,握手可能一直不返回。
+现在工具会自动检测 Fake-IP,通过 DNS-over-HTTPS 取真实 IP(如 `47.100.40.179`)
+并带原域名 SNI 直连;直连失败才回退到主机名。日志会打印
+`被解析为代理 Fake-IP(...),优先直连 ...`。
+仍失败时:把 `*.bambulab.com` 加入代理**直连(DIRECT)规则**、设置环境变量
+`BBL_FORCE_DIRECT=1` 强制只走直连,或临时关代理/切局域网模式(见下)。
 
 **断开/关窗卡死?**
 已在 v1.2 修复:断开与关闭改为后台强制拆除(不等待网络线程),UI 永不因此冻结。

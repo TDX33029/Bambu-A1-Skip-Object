@@ -314,8 +314,13 @@ A1 当前固件对 `print` 分类的控制命令做 **MQTT 命令签名校验**�
 **根因**:Clash/Mihomo 类代理的 Fake-IP DNS 模式会把 `cn.mqtt.bambulab.com`
 解析为 `198.18.x.x`(RFC 2544 保留段)。TCP/TLS 能建立(代理接管),
 但 MQTT 的 CONNECT→CONNACK 长连接按代理分流规则处理,被转发境外节点时握手无响应,
-paho 的 `connect()` 在 UI 线程里阻塞 → 界面卡死。实测同机状态下时通时不通
+paho 的 `connect()` 在 UI 线程里阻塞 → 界面卡死/报连接失败。实测同机状态下时通时不通
 (取决于代理当时的分流规则),完全解释"开发时测试成功、用户运行卡住"。
+
+**处理**(2026-10):`Printer.Connect` 检测到解析结果为 Fake-IP 时,用 AliDNS DoH
+(`https://223.5.5.5/resolve`)取真实 A 记录(实测 `47.100.40.179`),按
+`tcps://<真实IP>:8883` + `tls.Config.ServerName=<原域名>` 直连;失败再由 paho
+回退到主机名。可用 `BBL_FORCE_DIRECT=1` 强制只走直连。
 
 **修复(工具已内置)**:
 1. 连接移入后台线程,UI 不再冻结;15 秒 CONNACK 看门狗,超时给出针对性提示
