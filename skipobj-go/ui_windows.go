@@ -4,8 +4,12 @@ package main
 
 // 原生 Win32 窗口界面(lxn/walk,无 CGO)。
 // 交互模型与 Web 版一致:连接 → 状态轮询(pushall 触发完整 report)→
-// 云端任务/3mf 零件列表 → 俯视图点击选零件(遮罩颜色反解 identify_id,
-// 零件中心孔走最近像素搜索)→ 发送跳过命令(新/旧协议)。
+// 云端任务/3mf 零件列表 → 俯视图点击选零件(遮罩颜色反解 identify_id)→
+// 发送跳过命令(打印机应答为准)。
+//
+// 布局注意:declarative 里的 Size/MinSize 单位是 DIP(96 DPI),不是像素。
+// 窗口创建后按显示器工作区做一次 clamp,避免高 DPI 下窗口比屏幕还大
+// (旧版固定 1010x840,在 150% 缩放的 1080p 屏上会超出屏幕下沿)。
 
 import (
 	"fmt"
@@ -17,13 +21,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 )
+
+const spiGetWorkArea = 0x0030
 
 type winUI struct {
 	mw *walk.MainWindow
+	sv *walk.ScrollView
 
 	snCB    *walk.ComboBox
 	ipEd    *walk.LineEdit
@@ -32,37 +41,40 @@ type winUI struct {
 	connLb  *walk.Label
 
 	stState, stTask, stLayer, stPct, stSkip, stTid *walk.Label
+	stAck                                          *walk.Label
 
-	plateCw    *walk.CustomWidget
-	objList    *walk.ListBox
-	plateCB    *walk.ComboBox
-	manualEd   *walk.LineEdit
-	legacyCB   *walk.CheckBox
-	logView    *walk.TextEdit
-	fetchBtn   *walk.PushButton
-	sendSelBtn *walk.PushButton
-	sendManBtn *walk.PushButton
-
-	printer *Printer
-	creds   *Creds
-	cloudOK bool
-
-	mu         sync.Mutex
-	plates     []Plate
-	images     map[int]map[string]image.Image // plateIndex -> pick/top 解码图
-	curPlate   int
-	selected   map[int]bool
-	reported   map[int]bool
-	imgKind    string // pick | top
-	syncingSel bool
-	cloudCreds bool
-	logLines    []string
+	plateCw     *walk.CustomWidget
+	objList     *walk.ListBox
+	plateCB     *walk.ComboBox
+	manualEd    *walk.LineEdit
+	certBtn     *walk.PushButton
+	rawCB       *walk.CheckBox
+	logView     *walk.TextEdit
+	fetchBtn    *walk.PushButton
+	sendSelBtn  *walk.PushButton
+	sendManBtn  *walk.PushButton
 	modeCloudRB *walk.RadioButton
 	modeLanRB   *walk.RadioButton
 	viewPickRB  *walk.RadioButton
 	viewTopRB   *walk.RadioButton
-	hasPlates   bool
-	bmpCache    map[string]walk.Image
+
+	printer *Printer
+	creds   *Creds
+
+	mu         sync.Mutex
+	plates     []Plate
+	images     map[int]map[string]image.Image // plateIndex -> pick/top
+	curPlate   int
+	selected   map[int]bool
+	reported   map[int]bool // 打印机已上报跳过(s_obj)
+	imgKind    string       // pick | top
+	syncingSel bool
+	gen        int // 图片代次:bmpCache/centers 的失效依据
+	bmpCache   map[string]walk.Image
+	centers    map[string]map[int]image.Point // "gen:plate:kind" -> id -> 图像坐标
+	logLines   []string
+	lastState  string
+	lastHMS    string
 }
 
 func sortedSNs(m map[string]string) []string {
@@ -80,6 +92,7 @@ func runUI() {
 		reported: map[int]bool{},
 		images:   map[int]map[string]image.Image{},
 		bmpCache: map[string]walk.Image{},
+		centers:  map[string]map[int]image.Point{},
 		imgKind:  "pick",
 	}
 	if err := ui.build(); err != nil {
@@ -87,13 +100,15 @@ func runUI() {
 		RunWebUI("127.0.0.1:8974", true)
 		return
 	}
+	ui.fitToScreen()
 
 	if c, err := LoadCreds(); err != nil {
-		ui.cloudCreds = false
-		ui.setConnInfo(fmt.Sprintf("凭证: %v → 可用局域网模式", err))
+		ui.setConnInfo("凭证: 未读取到 → 可用局域网模式")
+		ui.Log(fmt.Sprintf("凭证读取失败: %v(可切换局域网模式:IP + 访问码)", err))
 	} else {
+		ui.mu.Lock()
 		ui.creds = c
-		ui.cloudCreds = true
+		ui.mu.Unlock()
 		sns := sortedSNs(c.Printers)
 		ui.snCB.SetModel(sns)
 		for i, sn := range sns {
@@ -102,14 +117,15 @@ func runUI() {
 				break
 			}
 		}
-		ui.setConnInfo(fmt.Sprintf("凭证: 已从 Bambu Studio 读取(账号 %s,区域 %s,打印机 %d 台)",
+		ui.setConnInfo(fmt.Sprintf("凭证: 已读取(账号 %s,区域 %s,%d 台)",
+			c.Account, strings.ToUpper(c.Region), len(c.Printers)))
+		ui.Log(fmt.Sprintf("凭证: 已从 Bambu Studio 读取(账号 %s,区域 %s,打印机 %d 台)",
 			c.Account, strings.ToUpper(c.Region), len(c.Printers)))
 	}
 	ui.Log(fmt.Sprintf("跳过对象工具 v%s(Go,原生窗口)", Version))
-	ui.Log("步骤:连接 →(打印中)从云端任务获取零件 → 点图/列表选择 → 跳过选中零件")
+	ui.Log("步骤:连接 →(打印中)从云端任务获取零件 → 点图/列表选择 → 跳过选中零件(自动申请并安装签名证书)")
 
 	go ui.statusLoop()
-	go ui.pushLoop()
 
 	ui.mw.Run()
 }
@@ -118,93 +134,112 @@ func (ui *winUI) build() error {
 	err := MainWindow{
 		AssignTo: &ui.mw,
 		Title:    "拓竹跳过对象工具(打印中跳过指定零件)",
-		MinSize:  Size{Width: 1010, Height: 840},
-		Size:     Size{Width: 1010, Height: 860},
-		Layout:   VBox{MarginsZero: false, Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 4},
+		MinSize:  Size{Width: 900, Height: 600}, // DIP
+		Size:     Size{Width: 1120, Height: 820},
+		Layout:   VBox{MarginsZero: true},
 		Children: []Widget{
-			GroupBox{Title: "1. 连接", Layout: HBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
+			ScrollView{
+				AssignTo:        &ui.sv,
+				HorizontalFixed: true, // 只在纵向滚动,内容宽度跟随窗口
+				Layout:          VBox{Margins: Margins{Left: 8, Top: 10, Right: 8, Bottom: 8}, Spacing: 14},
 				Children: []Widget{
-					Label{Text: "打印机:"},
-					ComboBox{AssignTo: &ui.snCB, MinSize: Size{Width: 210, Height: 0}},
-					RadioButton{AssignTo: &ui.modeCloudRB, Text: "云端"},
-					RadioButton{AssignTo: &ui.modeLanRB, Text: "局域网"},
-					Label{Text: "IP:"},
-					LineEdit{AssignTo: &ui.ipEd, CueBanner: "192.168.x.x", MaxSize: Size{Width: 120, Height: 0}},
-					Label{Text: "访问码:"},
-					LineEdit{AssignTo: &ui.codeEd, PasswordMode: true, MaxSize: Size{Width: 80, Height: 0}},
-					PushButton{AssignTo: &ui.connBtn, Text: "连接", OnClicked: ui.onConnect},
-					Label{AssignTo: &ui.connLb, Text: ""},
-				}},
-			GroupBox{Title: "2. 打印状态", Layout: HBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
-				Children: []Widget{
-					Label{Text: "状态:"}, Label{AssignTo: &ui.stState, Text: "-"},
-					Label{Text: " 任务:"}, Label{AssignTo: &ui.stTask, Text: "-"},
-					Label{Text: " 层:"}, Label{AssignTo: &ui.stLayer, Text: "-"},
-					Label{Text: " 进度:"}, Label{AssignTo: &ui.stPct, Text: "-"},
-					Label{Text: " 已跳过:"}, Label{AssignTo: &ui.stSkip, Text: "-"},
-					Label{Text: " 任务ID:"}, Label{AssignTo: &ui.stTid, Text: "-"},
-				}},
-			GroupBox{Title: "3. 要跳过的零件(俯视图上点击零件即可选中,与右侧列表联动)", Layout: HBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
-				Children: []Widget{
-					CustomWidget{
-						AssignTo: &ui.plateCw,
-						MinSize:  Size{Width: 430, Height: 430},
-						MaxSize:  Size{Width: 430, Height: 430},
-						Paint:    ui.paintPlate,
-					},
-					Composite{
-						Layout: VBox{Margins: Margins{Left: 4, Top: 0, Right: 0, Bottom: 0}, Spacing: 4},
+					GroupBox{Title: "1. 连接", Layout: VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}, Spacing: 4},
 						Children: []Widget{
+							Composite{Layout: HBox{MarginsZero: true, Spacing: 6},
+								Children: []Widget{
+									Label{Text: "打印机:"},
+									ComboBox{AssignTo: &ui.snCB, MinSize: Size{Width: 220, Height: 0}},
+									RadioButton{AssignTo: &ui.modeCloudRB, Text: "云端"},
+									RadioButton{AssignTo: &ui.modeLanRB, Text: "局域网"},
+									PushButton{AssignTo: &ui.connBtn, Text: "连接", OnClicked: ui.onConnect},
+								}},
+							Composite{Layout: HBox{MarginsZero: true, Spacing: 6},
+								Children: []Widget{
+									Label{Text: "IP:"},
+									LineEdit{AssignTo: &ui.ipEd, CueBanner: "192.168.x.x", MinSize: Size{Width: 130, Height: 0}, MaxSize: Size{Width: 160, Height: 0}},
+									Label{Text: "访问码:"},
+									LineEdit{AssignTo: &ui.codeEd, PasswordMode: true, MinSize: Size{Width: 100, Height: 0}, MaxSize: Size{Width: 120, Height: 0}},
+									Label{AssignTo: &ui.connLb, Text: ""},
+								}},
+						}},
+					GroupBox{Title: "2. 打印状态", Layout: Grid{Columns: 6, Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}, Spacing: 4},
+						Children: []Widget{
+							Label{Row: 0, Column: 0, Text: "状态"},
+							Label{Row: 0, Column: 1, Text: "任务"},
+							Label{Row: 0, Column: 2, Text: "层"},
+							Label{Row: 0, Column: 3, Text: "进度"},
+							Label{Row: 0, Column: 4, Text: "已跳过"},
+							Label{Row: 0, Column: 5, Text: "任务ID"},
+							Label{AssignTo: &ui.stState, Row: 1, Column: 0, Text: "-", MinSize: Size{Width: 80, Height: 0}},
+							Label{AssignTo: &ui.stTask, Row: 1, Column: 1, Text: "-", MinSize: Size{Width: 160, Height: 0}},
+							Label{AssignTo: &ui.stLayer, Row: 1, Column: 2, Text: "-", MinSize: Size{Width: 80, Height: 0}},
+							Label{AssignTo: &ui.stPct, Row: 1, Column: 3, Text: "-", MinSize: Size{Width: 70, Height: 0}},
+							Label{AssignTo: &ui.stSkip, Row: 1, Column: 4, Text: "-", MinSize: Size{Width: 100, Height: 0}},
+							Label{AssignTo: &ui.stTid, Row: 1, Column: 5, Text: "-", MinSize: Size{Width: 90, Height: 0}},
+						}},
+					GroupBox{Title: "3. 要跳过的零件(点击俯视图中的零件即可选中,与右侧列表联动)", Layout: HBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}, Spacing: 6},
+						Children: []Widget{
+							CustomWidget{
+								AssignTo:      &ui.plateCw,
+								MinSize:       Size{Width: 400, Height: 400},
+								StretchFactor: 1,
+								Paint:         ui.paintPlate,
+							},
 							Composite{
-								Layout: HBox{MarginsZero: true},
+								StretchFactor: 1,
+								Layout:        VBox{Margins: Margins{Left: 4, Top: 0, Right: 0, Bottom: 0}, Spacing: 4},
 								Children: []Widget{
 									PushButton{AssignTo: &ui.fetchBtn, Text: "从云端任务获取", Enabled: false,
 										OnClicked: ui.onFetch},
 									PushButton{Text: "打开切片 3mf…", OnClicked: ui.onOpen3mf},
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: 4},
+										Children: []Widget{
+											Label{Text: "盘:"},
+											ComboBox{AssignTo: &ui.plateCB, MinSize: Size{Width: 160, Height: 0}, MaxSize: Size{Width: 240, Height: 0},
+												OnCurrentIndexChanged: ui.onPlateChanged},
+										},
+									},
+									ListBox{AssignTo: &ui.objList, MultiSelection: true,
+										MinSize: Size{Width: 0, Height: 240}, StretchFactor: 1,
+										OnSelectedIndexesChanged: ui.onListSelChanged},
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: 4},
+										Children: []Widget{
+											PushButton{Text: "全选", OnClicked: func() { ui.setAll(true) }},
+											PushButton{Text: "清空", OnClicked: func() { ui.setAll(false) }},
+											RadioButton{AssignTo: &ui.viewPickRB, Text: "选择视图",
+												OnClicked: func() { ui.setView("pick") }},
+											RadioButton{AssignTo: &ui.viewTopRB, Text: "渲染图",
+												OnClicked: func() { ui.setView("top") }},
+										},
+									},
 								},
 							},
-							Composite{
-								Layout: HBox{MarginsZero: true},
+						}},
+					GroupBox{Title: "4. 发送跳过命令", Layout: VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}, Spacing: 4},
+						Children: []Widget{
+							Composite{Layout: HBox{MarginsZero: true, Spacing: 6},
 								Children: []Widget{
-									Label{Text: "盘:"},
-									ComboBox{AssignTo: &ui.plateCB, MinSize: Size{Width: 260, Height: 0},
-										OnCurrentIndexChanged: ui.onPlateChanged},
-								},
-							},
-							ListBox{AssignTo: &ui.objList, MultiSelection: true,
-								OnSelectedIndexesChanged: ui.onListSelChanged},
-							Composite{
-								Layout: HBox{MarginsZero: true},
+									Label{Text: "手动 ID(逗号分隔):"},
+									LineEdit{AssignTo: &ui.manualEd, CueBanner: "如 197,175", MinSize: Size{Width: 180, Height: 0}, MaxSize: Size{Width: 260, Height: 0}},
+									PushButton{AssignTo: &ui.sendManBtn, Text: "跳过手动输入", OnClicked: ui.onSendManual},
+									PushButton{AssignTo: &ui.certBtn, Text: "准备签名证书", OnClicked: ui.onPrepareCert, MaxSize: Size{Width: 130, Height: 0}},
+									CheckBox{AssignTo: &ui.rawCB, Text: "原始报文", OnCheckedChanged: ui.onRawToggle},
+								}},
+							Composite{Layout: HBox{MarginsZero: true, Spacing: 6},
 								Children: []Widget{
-									PushButton{Text: "全选", OnClicked: func() { ui.setAll(true) }},
-									PushButton{Text: "清空", OnClicked: func() { ui.setAll(false) }},
-								},
-							},
-							Composite{
-								Layout: HBox{MarginsZero: true},
-								Children: []Widget{
-									RadioButton{AssignTo: &ui.viewPickRB, Text: "选择视图(可点击)",
-										OnClicked: func() { ui.setView("pick") }},
-									RadioButton{AssignTo: &ui.viewTopRB, Text: "渲染图(预览)",
-										OnClicked: func() { ui.setView("top") }},
-								},
-							},
-						},
-					},
-				}},
-			GroupBox{Title: "4. 发送跳过命令", Layout: HBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
-				Children: []Widget{
-					Label{Text: "手动 ID(逗号分隔):"},
-					LineEdit{AssignTo: &ui.manualEd, CueBanner: "如 197,175", MaxSize: Size{Width: 150, Height: 0}},
-					CheckBox{AssignTo: &ui.legacyCB, Text: "旧协议(Studio 格式)"},
-					PushButton{AssignTo: &ui.sendManBtn, Text: "跳过手动输入", OnClicked: ui.onSendManual},
-					PushButton{AssignTo: &ui.sendSelBtn, Text: "跳过选中零件", OnClicked: ui.onSendSelected},
-				}},
-			GroupBox{Title: "MQTT 日志", Layout: VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
-				Children: []Widget{
-					TextEdit{AssignTo: &ui.logView, ReadOnly: true,
-						MinSize: Size{Width: 0, Height: 120}},
-				}},
+									Label{AssignTo: &ui.stAck, Text: "打印机应答: -"},
+									PushButton{AssignTo: &ui.sendSelBtn, Text: "跳过选中零件", OnClicked: ui.onSendSelected, MaxSize: Size{Width: 180, Height: 0}},
+								}},
+						}},
+					GroupBox{Title: "MQTT 日志", Layout: VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 4}},
+						Children: []Widget{
+							TextEdit{AssignTo: &ui.logView, ReadOnly: true,
+								MinSize: Size{Width: 0, Height: 150}},
+						}},
+				},
+			},
 		},
 	}.Create()
 	if err != nil {
@@ -216,9 +251,56 @@ func (ui *winUI) build() error {
 	return nil
 }
 
+// fitToScreen 按当前显示器工作区收缩窗口,保证高 DPI / 小屏下窗口完整可见。
+func (ui *winUI) fitToScreen() {
+	dpi := ui.mw.DPI()
+	if dpi <= 0 {
+		dpi = 96
+	}
+	wa := workAreaPixels()
+	availW := int(wa.Width)*96/dpi - 16
+	availH := int(wa.Height)*96/dpi - 40
+	wantW, wantH := 1120, 820
+	if availW > 400 && wantW > availW {
+		wantW = availW
+	}
+	if availH > 300 && wantH > availH {
+		wantH = availH
+	}
+	minW, minH := 900, 600
+	if wantW < minW {
+		minW = wantW
+	}
+	if wantH < minH {
+		minH = wantH
+	}
+	_ = ui.mw.SetMinMaxSize(walk.Size{Width: minW, Height: minH}, walk.Size{})
+	_ = ui.mw.SetSize(walk.Size{Width: wantW, Height: wantH})
+	if availW > 0 && availH > 0 {
+		x := int(wa.X)*96/dpi + (availW-wantW)/2
+		y := int(wa.Y)*96/dpi + (availH-wantH)/2
+		_ = ui.mw.SetX(x)
+		_ = ui.mw.SetY(y)
+	}
+}
+
+func workAreaPixels() walk.Rectangle {
+	var rc win.RECT
+	if win.SystemParametersInfo(spiGetWorkArea, 0, unsafe.Pointer(&rc), 0) {
+		return walk.Rectangle{
+			X: int(rc.Left), Y: int(rc.Top),
+			Width: int(rc.Right - rc.Left), Height: int(rc.Bottom - rc.Top),
+		}
+	}
+	return walk.Rectangle{Width: 1920, Height: 1080}
+}
+
 // ---- 日志(线程安全) ----
 
 func (ui *winUI) Log(s string) {
+	if ui.logView == nil {
+		return
+	}
 	f := func() {
 		ui.logLines = append(ui.logLines, time.Now().Format("[15:04:05] ")+s)
 		if len(ui.logLines) > 500 {
@@ -226,14 +308,26 @@ func (ui *winUI) Log(s string) {
 		}
 		ui.logView.SetText(strings.Join(ui.logLines, "\r\n"))
 	}
-	if ui.logView != nil {
-		ui.mw.Synchronize(f)
-	}
+	ui.mw.Synchronize(f)
 }
 
 func (ui *winUI) setConnInfo(s string) {
 	if ui.connLb != nil {
 		ui.mw.Synchronize(func() { ui.connLb.SetText(s) })
+	}
+}
+
+func (ui *winUI) onRawToggle() {
+	p := ui.currentPrinter()
+	if p == nil {
+		return
+	}
+	if ui.rawCB.Checked() {
+		p.SetRawLog(func(s string) { ui.Log("RAW " + s) })
+		ui.Log("已开启原始报文记录")
+	} else {
+		p.SetRawLog(nil)
+		ui.Log("已关闭原始报文记录")
 	}
 }
 
@@ -268,6 +362,9 @@ func (ui *winUI) onConnect() {
 		}
 		p.SetupLAN(strings.TrimSpace(ip), strings.TrimSpace(code), "")
 	}
+	if ui.rawCB.Checked() {
+		p.SetRawLog(func(s string) { ui.Log("RAW " + s) })
+	}
 	ui.setPrinter(p)
 	ui.connBtn.SetEnabled(false)
 	ui.Log(fmt.Sprintf("正在连接 %s:8883 …", p.Host))
@@ -278,7 +375,9 @@ func (ui *winUI) onConnect() {
 			if err != nil {
 				ui.Log("[错误] 连接失败: " + err.Error())
 				walk.MsgBox(ui.mw, "连接失败", err.Error(), walk.MsgBoxIconError)
+				return
 			}
+			ui.connBtn.SetText("断开")
 		})
 	}()
 }
@@ -289,63 +388,92 @@ func (ui *winUI) currentPrinter() *Printer {
 	return ui.printer
 }
 
+func (ui *winUI) credsOrNil() *Creds {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	return ui.creds
+}
+
 func (ui *winUI) setPrinter(p *Printer) {
 	ui.mu.Lock()
 	ui.printer = p
 	ui.mu.Unlock()
 }
 
-// ---- 轮询与 pushall ----
+// ---- 状态轮询与 pushall ----
 
 func (ui *winUI) statusLoop() {
 	reportedOnce := false
-	pushedOnce := false
+	tick := 0
 	for {
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
+		tick++
 		p := ui.currentPrinter()
 		if p == nil || !p.IsConnected() {
-			reportedOnce, pushedOnce = false, false
+			reportedOnce = false
 			continue
 		}
-		p.RequestPush()
-		if !pushedOnce {
-			pushedOnce = true
-			ui.Log("已请求打印机上报完整状态(pushall)…")
+		if tick%3 == 1 {
+			p.RequestPush()
 		}
 		sn, report := p.Report()
 		if report == nil {
 			continue
 		}
-		tid := asString(report["task_id"])
+		tid := validTaskID(report)
 		gcode := asString(report["gcode_state"])
+		skipped := skippedIDList(report)
+		skips := make([]int, 0, len(skipped))
+		hms := HMSNotices(report)
+		hasCreds := ui.credsOrNil() != nil
 		ui.mw.Synchronize(func() {
 			ui.stState.SetText(stateText(gcode))
-			ui.stTask.SetText(orDash(report["subtask_name"]))
+			setLabel(ui.stTask, elide(orDash(report["subtask_name"]), 26))
 			ui.stLayer.SetText(orDash(report["layer_num"]) + "/" + orDash(report["total_layer_num"]))
-			ui.stPct.SetText(pctText(report["print_percent"]))
-			ui.stSkip.SetText(orDash(report["skip_objects"]))
+			ui.stPct.SetText(pctText(report["mc_percent"]))
+			ui.stSkip.SetText(orDash(skips))
 			ui.stTid.SetText(orDash(report["task_id"]))
 			printing := gcode == "RUNNING" || gcode == "PAUSE"
 			ui.sendSelBtn.SetEnabled(printing)
 			ui.sendManBtn.SetEnabled(printing)
-			ui.fetchBtn.SetEnabled(tid != "" && ui.cloudCreds)
+			ui.fetchBtn.SetEnabled(tid != "" && hasCreds)
+
+			// 已跳过集合以打印机 s_obj 为准;新出现的标记进列表并取消勾选
+			changed := false
+			for _, id := range skips {
+				if !ui.reported[id] {
+					ui.reported[id] = true
+					delete(ui.selected, id)
+					changed = true
+				}
+			}
+			if changed && len(ui.plates) > 0 {
+				ui.rebuildObjectListLocked()
+				ui.plateCw.Invalidate()
+			}
+			if gcode != ui.lastState {
+				ui.lastState = gcode
+				if gcode != "" {
+					ui.Log("状态: " + stateText(gcode))
+				}
+			}
+			if len(hms) > 0 {
+				joined := strings.Join(hms, ";")
+				if joined != ui.lastHMS {
+					ui.lastHMS = joined
+					for _, h := range hms {
+						ui.Log("[HMS] " + h)
+					}
+				}
+			}
 			if !reportedOnce && tid != "" {
 				reportedOnce = true
 				SaveLastSN(sn)
-				ui.Log(fmt.Sprintf("已解析打印状态:%v(任务 %s,%s/%s 层)→ 可从云端任务获取零件",
+				ui.Log(fmt.Sprintf("已解析打印状态:%v(任务 %s,%s/%s 层)",
 					orDash(report["subtask_name"]), tid,
 					orDash(report["layer_num"]), orDash(report["total_layer_num"])))
 			}
 		})
-	}
-}
-
-func (ui *winUI) pushLoop() {
-	for {
-		time.Sleep(3 * time.Second)
-		if p := ui.currentPrinter(); p != nil && p.IsConnected() {
-			p.RequestPush()
-		}
 	}
 }
 
@@ -364,7 +492,7 @@ func (ui *winUI) onFetch() {
 		walk.MsgBox(ui.mw, "提示", "尚未收到打印机 report", walk.MsgBoxIconWarning)
 		return
 	}
-	tid := asString(report["task_id"])
+	tid := validTaskID(report)
 	if tid == "" {
 		walk.MsgBox(ui.mw, "提示",
 			"report 中没有任务 ID(需云端任务;本地 SD 打印请打开切片 3mf)", walk.MsgBoxIconWarning)
@@ -422,14 +550,13 @@ func (ui *winUI) setPlates(plates []Plate) {
 	ui.images = map[int]map[string]image.Image{}
 	ui.selected = map[int]bool{}
 	ui.curPlate = 0
-	ui.hasPlates = len(plates) > 0
+	ui.gen++
+	ui.bmpCache = map[string]walk.Image{}
+	ui.centers = map[string]map[int]image.Point{}
 	for _, pl := range plates {
-		if ui.images[pl.Index] == nil {
-			ui.images[pl.Index] = map[string]image.Image{}
-		}
-		m := ui.images[pl.Index]
+		m := map[string]image.Image{}
 		dec := func(data []byte, key string) {
-			if data == nil || m[key] != nil {
+			if len(data) == 0 || m[key] != nil {
 				return
 			}
 			if im, _, err := image.Decode(strings.NewReader(string(data))); err == nil {
@@ -438,6 +565,7 @@ func (ui *winUI) setPlates(plates []Plate) {
 		}
 		dec(pl.PickPNG, "pick")
 		dec(pl.TopPNG, "top")
+		ui.images[pl.Index] = m
 	}
 	ui.mu.Unlock()
 	ui.rebuildPlateUI()
@@ -462,26 +590,27 @@ func (ui *winUI) rebuildPlateUI() {
 	ui.plateCw.Invalidate()
 }
 
-// rebuildObjectListLocked:UI 线程
+// rebuildObjectListLocked:UI 线程(调用方持锁)
 func (ui *winUI) rebuildObjectListLocked() {
 	if ui.curPlate >= len(ui.plates) {
 		ui.objList.SetModel([]string{})
 		return
 	}
 	pl := ui.plates[ui.curPlate]
-	var items []string
+	items := make([]string, 0, len(pl.Objects))
 	for _, o := range pl.Objects {
-		if o.Skipped {
-			ui.reported[o.IdentifyID] = true
-			ui.selected[o.IdentifyID] = true
+		skipped := o.Skipped || ui.reported[o.IdentifyID]
+		tag := ""
+		if skipped {
+			tag = "  [已跳过]"
 		}
-		items = append(items, fmt.Sprintf("#%d  %s", o.IdentifyID, o.Name))
+		items = append(items, fmt.Sprintf("#%d  %s%s", o.IdentifyID, o.Name, tag))
 	}
 	ui.objList.SetModel(items)
 	ui.syncSelectionToListLocked()
 }
 
-// selected → ListBox 选中态(UI 线程)
+// selected → ListBox 选中态(UI 线程,调用方持锁)
 func (ui *winUI) syncSelectionToListLocked() {
 	if ui.curPlate >= len(ui.plates) {
 		return
@@ -499,12 +628,12 @@ func (ui *winUI) syncSelectionToListLocked() {
 
 // ListBox 选择 → selected(用户手动多选)
 func (ui *winUI) onListSelChanged() {
-	if ui.syncingSel || !ui.hasPlates {
+	if ui.syncingSel {
 		return
 	}
 	ui.mu.Lock()
-	defer ui.mu.Unlock()
 	if ui.curPlate >= len(ui.plates) {
+		ui.mu.Unlock()
 		return
 	}
 	objs := ui.plates[ui.curPlate].Objects
@@ -515,6 +644,7 @@ func (ui *winUI) onListSelChanged() {
 		}
 	}
 	ui.selected = newSel
+	ui.mu.Unlock()
 	ui.plateCw.Invalidate()
 }
 
@@ -526,13 +656,9 @@ func (ui *winUI) onPlateChanged() {
 	ui.mu.Lock()
 	ui.curPlate = i
 	ui.selected = map[int]bool{}
+	ui.rebuildObjectListLocked()
 	ui.mu.Unlock()
-	ui.mw.Synchronize(func() {
-		ui.mu.Lock()
-		ui.rebuildObjectListLocked()
-		ui.mu.Unlock()
-		ui.plateCw.Invalidate()
-	})
+	ui.plateCw.Invalidate()
 }
 
 func (ui *winUI) setAll(v bool) {
@@ -542,46 +668,37 @@ func (ui *winUI) setAll(v bool) {
 		return
 	}
 	for _, o := range ui.plates[ui.curPlate].Objects {
-		if !o.Skipped {
-			ui.selected[o.IdentifyID] = v
+		if o.Skipped || ui.reported[o.IdentifyID] {
+			continue
 		}
+		ui.selected[o.IdentifyID] = v
 	}
+	ui.syncSelectionToListLocked()
 	ui.mu.Unlock()
-	ui.mw.Synchronize(func() {
-		ui.mu.Lock()
-		ui.syncSelectionToListLocked()
-		ui.mu.Unlock()
-		ui.plateCw.Invalidate()
-	})
+	ui.plateCw.Invalidate()
 }
 
 func (ui *winUI) setView(kind string) {
 	ui.mu.Lock()
 	ui.imgKind = kind
 	ui.mu.Unlock()
-	ui.mw.Synchronize(func() { ui.plateCw.Invalidate() })
+	ui.plateCw.Invalidate()
 }
 
 // ---- 俯视图绘制(Paint 在 UI 线程) ----
 
-func (ui *winUI) currentPlateImage() image.Image {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-	if ui.curPlate >= len(ui.plates) {
-		return nil
+// fitImage 计算图片在画布内的等比缩放布局(像素)
+func fitImage(iw, ih int, cb walk.Rectangle) (ox, oy, w, h int) {
+	if iw <= 0 || ih <= 0 || cb.Width <= 0 || cb.Height <= 0 {
+		return 0, 0, 0, 0
 	}
-	pl := ui.plates[ui.curPlate]
-	m, ok := ui.images[pl.Index]
-	if !ok {
-		return nil
+	s := float64(cb.Width) / float64(iw)
+	if s > float64(cb.Height)/float64(ih) {
+		s = float64(cb.Height) / float64(ih)
 	}
-	if im := m[ui.imgKind]; im != nil {
-		return im
-	}
-	if ui.imgKind == "pick" {
-		return m["top"] // 无遮罩图时退化为渲染预览
-	}
-	return nil
+	w, h = int(float64(iw)*s), int(float64(ih)*s)
+	ox, oy = cb.X+(cb.Width-w)/2, cb.Y+(cb.Height-h)/2
+	return
 }
 
 func (ui *winUI) paintPlate(canvas *walk.Canvas, updateBounds walk.Rectangle) error {
@@ -591,7 +708,7 @@ func (ui *winUI) paintPlate(canvas *walk.Canvas, updateBounds walk.Rectangle) er
 	}
 	ui.mu.Lock()
 	var pl *Plate
-	var img image.Image
+	var img, pick image.Image
 	if ui.curPlate < len(ui.plates) {
 		pl = &ui.plates[ui.curPlate]
 		m := ui.images[pl.Index]
@@ -599,12 +716,13 @@ func (ui *winUI) paintPlate(canvas *walk.Canvas, updateBounds walk.Rectangle) er
 		if img == nil && ui.imgKind == "pick" {
 			img = m["top"]
 		}
+		pick = m["pick"]
 	}
-	sel := map[int]bool{}
+	sel := make(map[int]bool, len(ui.selected))
 	for k, v := range ui.selected {
 		sel[k] = v
 	}
-	kind := ui.imgKind
+	gen, plateIdx := ui.gen, ui.curPlate
 	ui.mu.Unlock()
 
 	if pl == nil {
@@ -615,40 +733,59 @@ func (ui *winUI) paintPlate(canvas *walk.Canvas, updateBounds walk.Rectangle) er
 		ui.drawText(canvas, updateBounds, "无俯视图,可直接在右侧列表勾选")
 		return nil
 	}
-	cb := updateBounds
-	iw, ih := float64(img.Bounds().Dx()), float64(img.Bounds().Dy())
-	s := float64(cb.Width) / iw
-	if s > float64(cb.Height)/ih {
-		s = float64(cb.Height) / ih
+	b := img.Bounds()
+	ox, oy, w, h := fitImage(b.Dx(), b.Dy(), updateBounds)
+	if w <= 0 || h <= 0 {
+		return nil
 	}
-	if s > 1 {
-		s = 1
+	dpi := canvas.DPI()
+	if dpi <= 0 {
+		dpi = 96
 	}
-	w, h := int(iw*s), int(ih*s)
-	ox, oy := (cb.Width-w)/2, (cb.Height-h)/2
-
-	bmpKey := fmt.Sprintf("%d:%s:%d", pl.Index, kind, w)
-	bmp, ok := ui.bmpCache[bmpKey]
+	key := fmt.Sprintf("%d:%s:%d:%d:%d:%d", gen, ui.imgKind, plateIdx, w, h, dpi)
+	ui.mu.Lock()
+	bmp, ok := ui.bmpCache[key]
+	ui.mu.Unlock()
 	if !ok {
-		b, err := walk.NewBitmapFromImageForDPI(img, 96)
+		nb, err := walk.NewBitmapFromImageForDPI(img, dpi)
 		if err != nil {
 			return nil
 		}
-		bmp = b
-		ui.bmpCache[bmpKey] = bmp
+		ui.mu.Lock()
+		// 旧的代次/尺寸缓存直接丢弃,避免内存增长
+		for k := range ui.bmpCache {
+			if !strings.HasPrefix(k, fmt.Sprintf("%d:", gen)) {
+				delete(ui.bmpCache, k)
+			}
+		}
+		ui.bmpCache[key] = nb
+		ui.mu.Unlock()
+		bmp = nb
 	}
 	canvas.DrawImageStretched(bmp, walk.Rectangle{X: ox, Y: oy, Width: w, Height: h})
 
-	// 选中标记:该 id 遮罩像素包围盒中心画绿圈(包围盒不受零件中心孔影响)
-	if greenPen, err := walk.NewCosmeticPen(walk.PenSolid, walk.RGB(0, 230, 118)); err == nil {
-		defer greenPen.Dispose()
-		for iid, on := range sel {
-			if !on {
-				continue
-			}
-			if cx, cy, hit := ui.objPixelCenter(img, iid, w, h, ox, oy); hit {
-				r := 14
-				canvas.DrawEllipse(greenPen, walk.Rectangle{X: cx - r, Y: cy - r, Width: 2 * r, Height: 2 * r})
+	// 选中标记:以 pick 遮罩的包围盒中心画绿圈(不受中心孔影响)
+	if pick != nil {
+		centers := ui.pickCenters(gen, plateIdx, pick)
+		if len(centers) > 0 && len(sel) > 0 {
+			pb := pick.Bounds()
+			sx := float64(w) / float64(pb.Dx())
+			sy := float64(h) / float64(pb.Dy())
+			if pen, err := walk.NewCosmeticPen(walk.PenSolid, walk.RGB(0, 230, 118)); err == nil {
+				defer pen.Dispose()
+				for id, on := range sel {
+					if !on {
+						continue
+					}
+					c, ok := centers[id]
+					if !ok {
+						continue
+					}
+					r := 16 * dpi / 96
+					canvas.DrawEllipse(pen, walk.Rectangle{
+						X: ox + int(float64(c.X)*sx) - r, Y: oy + int(float64(c.Y)*sy) - r,
+						Width: 2 * r, Height: 2 * r})
+				}
 			}
 		}
 	}
@@ -657,52 +794,67 @@ func (ui *winUI) paintPlate(canvas *walk.Canvas, updateBounds walk.Rectangle) er
 
 func (ui *winUI) drawText(canvas *walk.Canvas, cb walk.Rectangle, text string) {
 	canvas.DrawText(text, ui.mw.Font(), walk.RGB(136, 136, 136),
-		walk.Rectangle{X: cb.Width/2 - 130, Y: cb.Height/2 - 10, Width: 260, Height: 20}, 0)
+		walk.Rectangle{X: cb.X + cb.Width/2 - 150, Y: cb.Y + cb.Height/2 - 10, Width: 300, Height: 20}, 0)
 }
 
-// objPixelCenter:该 id 遮罩色像素包围盒中心(包围盒不受零件中心孔影响)
-func (ui *winUI) objPixelCenter(img image.Image, iid int, w, h, ox, oy int) (int, int, bool) {
+// pickCenters 一次扫描 pick 遮罩,缓存每个 identify_id 的包围盒中心(图像坐标)
+func (ui *winUI) pickCenters(gen, plateIdx int, img image.Image) map[int]image.Point {
+	key := fmt.Sprintf("%d:%d:pick", gen, plateIdx)
+	ui.mu.Lock()
+	if c, ok := ui.centers[key]; ok {
+		ui.mu.Unlock()
+		return c
+	}
+	ui.mu.Unlock()
+
 	b := img.Bounds()
-	iw, ih := float64(b.Dx()), float64(b.Dy())
-	sx, sy := iw/float64(w), ih/float64(h)
-	minx, miny, maxx, maxy, n := 0, 0, 0, 0, 0
-	for dy := 0; dy < h; dy += 2 {
-		for dx := 0; dx < w; dx += 2 {
-			ix := b.Min.X + int(float64(dx)*sx)
-			iy := b.Min.Y + int(float64(dy)*sy)
-			if ix >= b.Max.X || iy >= b.Max.Y {
+	type box struct{ minx, miny, maxx, maxy int }
+	boxes := map[int]*box{}
+	step := 2
+	if b.Dx()*b.Dy() < 700*700 {
+		step = 1
+	}
+	for y := b.Min.Y; y < b.Max.Y; y += step {
+		for x := b.Min.X; x < b.Max.X; x += step {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			id := int(uint8(r>>8)) + int(uint8(g>>8))<<8 + int(uint8(bl>>8))<<16
+			if id == 0 {
 				continue
 			}
-			r, g, bl, _ := img.At(ix, iy).RGBA()
-			id := int(uint8(r>>8)) + int(uint8(g>>8))*256 + int(uint8(bl>>8))*65536
-			if id == iid {
-				if n == 0 {
-					minx, miny, maxx, maxy = dx, dy, dx, dy
-				} else {
-					if dx < minx {
-						minx = dx
-					}
-					if dy < miny {
-						miny = dy
-					}
-					if dx > maxx {
-						maxx = dx
-					}
-					if dy > maxy {
-						maxy = dy
-					}
-				}
-				n++
+			bx := boxes[id]
+			if bx == nil {
+				boxes[id] = &box{x, y, x, y}
+				continue
+			}
+			if x < bx.minx {
+				bx.minx = x
+			}
+			if y < bx.miny {
+				bx.miny = y
+			}
+			if x > bx.maxx {
+				bx.maxx = x
+			}
+			if y > bx.maxy {
+				bx.maxy = y
 			}
 		}
 	}
-	if n == 0 {
-		return 0, 0, false
+	out := make(map[int]image.Point, len(boxes))
+	for id, bx := range boxes {
+		if id == 0 {
+			continue
+		}
+		out[id] = image.Pt((bx.minx+bx.maxx)/2, (bx.miny+bx.maxy)/2)
 	}
-	return ox + (minx+maxx)/2, oy + (miny+maxy)/2, true
+	ui.mu.Lock()
+	ui.centers[key] = out
+	ui.mu.Unlock()
+	return out
 }
 
-// onPlateClick:控件坐标 → 图像坐标 → 遮罩色反解 identify_id
+// onPlateClick:控件坐标 → 图像坐标 → 用 pick 遮罩反解 identify_id
+// (渲染图视图下也按同一几何关系取 pick,避免在照片上取色导致点不中)
 func (ui *winUI) onPlateClick(mx, my int) {
 	ui.mu.Lock()
 	if ui.curPlate >= len(ui.plates) {
@@ -711,37 +863,29 @@ func (ui *winUI) onPlateClick(mx, my int) {
 	}
 	pl := &ui.plates[ui.curPlate]
 	m := ui.images[pl.Index]
-	img := m[ui.imgKind]
-	if img == nil && ui.imgKind == "pick" {
-		img = m["top"]
+	disp := m[ui.imgKind]
+	if disp == nil && ui.imgKind == "pick" {
+		disp = m["top"]
 	}
+	pick := m["pick"]
 	ui.mu.Unlock()
-	if img == nil {
+	if disp == nil || pick == nil {
 		return
 	}
 	cb := ui.plateCw.ClientBounds()
-	iw, ih := float64(img.Bounds().Dx()), float64(img.Bounds().Dy())
-	s := float64(cb.Width) / iw
-	if s > float64(cb.Height)/ih {
-		s = float64(cb.Height) / ih
-	}
-	if s > 1 {
-		s = 1
-	}
-	w, h := int(iw*s), int(ih*s)
-	ox, oy := (cb.Width-w)/2, (cb.Height-h)/2
-	if mx < ox || my < oy || mx >= ox+w || my >= oy+h {
+	ox, oy, w, h := fitImage(disp.Bounds().Dx(), disp.Bounds().Dy(), cb)
+	if w <= 0 || h <= 0 || mx < ox || my < oy || mx >= ox+w || my >= oy+h {
 		return
 	}
-	b := img.Bounds()
-	ix := b.Min.X + int(float64(mx-ox)/s)
-	iy := b.Min.Y + int(float64(my-oy)/s)
+	pb := pick.Bounds()
+	ix := pb.Min.X + int(float64(mx-ox)*float64(pb.Dx())/float64(w))
+	iy := pb.Min.Y + int(float64(my-oy)*float64(pb.Dy())/float64(h))
 	dec := func(x, y int) int {
-		if x < b.Min.X || y < b.Min.Y || x >= b.Max.X || y >= b.Max.Y {
+		if x < pb.Min.X || y < pb.Min.Y || x >= pb.Max.X || y >= pb.Max.Y {
 			return 0
 		}
-		r, g, bl, _ := img.At(x, y).RGBA()
-		return int(uint8(r>>8)) + int(uint8(g>>8))*256 + int(uint8(bl>>8))*65536
+		r, g, bl, _ := pick.At(x, y).RGBA()
+		return int(uint8(r>>8)) + int(uint8(g>>8))<<8 + int(uint8(bl>>8))<<16
 	}
 	valid := map[int]bool{}
 	for _, o := range pl.Objects {
@@ -750,9 +894,9 @@ func (ui *winUI) onPlateClick(mx, my int) {
 	}
 	iid := dec(ix, iy)
 	if !valid[iid] {
-		// 零件中心孔等镂空区域:环形搜索最近有效遮罩色
+		// 零件中心孔等镂空区域:环形搜索最近的有效遮罩色
 		best, bestD := 0, 1<<30
-		for r := 3; r <= 70; r += 3 {
+		for r := 3; r <= 90; r += 3 {
 			for a := 0; a < 360; a += 5 {
 				nx := ix + int(float64(r)*math.Cos(float64(a)*math.Pi/180))
 				ny := iy + int(float64(r)*math.Sin(float64(a)*math.Pi/180))
@@ -780,12 +924,15 @@ func (ui *winUI) onPlateClick(mx, my int) {
 	if obj == nil || obj.Skipped {
 		return
 	}
-	if ui.selected[iid] {
-		delete(ui.selected, iid)
+	ui.mu.Lock()
+	key := obj.IdentifyID
+	if ui.selected[key] {
+		delete(ui.selected, key)
 	} else {
-		ui.selected[iid] = true
+		ui.selected[key] = true
 	}
 	ui.syncSelectionToListLocked()
+	ui.mu.Unlock()
 	ui.plateCw.Invalidate()
 }
 
@@ -804,16 +951,67 @@ func (ui *winUI) collectSelected() []int {
 	return ids
 }
 
+// onPrepareCert 预先申请并安装签名证书(跳过时会自动做,这里便于手动排查)
+func (ui *winUI) onPrepareCert() {
+	p := ui.currentPrinter()
+	if p == nil {
+		walk.MsgBox(ui.mw, "提示", "请先连接打印机", walk.MsgBoxIconWarning)
+		return
+	}
+	ui.certBtn.SetEnabled(false)
+	ui.Log("正在申请并安装签名证书 …")
+	go func() {
+		err := p.EnsureCertInstalled()
+		ui.mw.Synchronize(func() {
+			ui.certBtn.SetEnabled(true)
+			if err != nil {
+				ui.Log("[错误] 证书准备失败: " + err.Error())
+				walk.MsgBox(ui.mw, "证书准备失败", err.Error(), walk.MsgBoxIconError)
+				return
+			}
+			ac, _ := p.ensureAppCert()
+			id := ""
+			if ac != nil {
+				id = ac.CertID
+			}
+			ui.Log("[+] 签名证书就绪: " + id)
+			walk.MsgBox(ui.mw, "完成", "签名证书已安装到打印机:\n"+id, walk.MsgBoxIconInformation)
+		})
+	}()
+}
+
 func (ui *winUI) sendIDs(ids []int) {
 	p := ui.currentPrinter()
 	if p == nil {
+		walk.MsgBox(ui.mw, "提示", "请先连接打印机", walk.MsgBoxIconWarning)
 		return
 	}
-	if err := p.SkipObjects(ids, ui.legacyCB.Checked()); err != nil {
-		walk.MsgBox(ui.mw, "发送失败", err.Error(), walk.MsgBoxIconError)
-		return
-	}
-	ui.Log(fmt.Sprintf("[+] 已发送跳过命令: %v", ids))
+	ui.sendSelBtn.SetEnabled(false)
+	ui.sendManBtn.SetEnabled(false)
+	ui.Log(fmt.Sprintf("正在发送跳过命令: %v", ids))
+	go func() {
+		res, err := p.SkipObjects(ids)
+		ui.mw.Synchronize(func() {
+			ui.sendSelBtn.SetEnabled(true)
+			ui.sendManBtn.SetEnabled(true)
+			if err != nil {
+				ui.Log("[错误] " + err.Error())
+				ui.stAck.SetText("打印机应答: 未发送(" + err.Error() + ")")
+				walk.MsgBox(ui.mw, "未发送", err.Error(), walk.MsgBoxIconWarning)
+				return
+			}
+			if res.Accepted {
+				msg := fmt.Sprintf("已确认跳过 %v(%s)", res.IDs, res.Note)
+				ui.Log("[+] " + msg)
+				ui.stAck.SetText("打印机应答: " + msg)
+			} else {
+				msg := fmt.Sprintf("跳过失败(%s):%s", res.Variant, res.Note)
+				ui.Log("[!] " + msg)
+				ui.stAck.SetText("打印机应答: " + msg)
+				walk.MsgBox(ui.mw, "打印机未接受", msg, walk.MsgBoxIconError)
+			}
+		})
+	}()
 }
 
 func (ui *winUI) onSendSelected() {
@@ -852,14 +1050,11 @@ func (ui *winUI) onSendManual() {
 	ui.sendIDs(ids)
 }
 
-func pctText(v any) string {
-	f, ok := v.(float64)
-	if !ok {
-		return "-"
+// setLabel 设置标签文本并把完整内容放到 ToolTip(长名字不再“显示不全”)
+func setLabel(lb *walk.Label, s string) {
+	if lb == nil {
+		return
 	}
-	p := int(f)
-	if p < 0 || p > 100 {
-		return "-"
-	}
-	return fmt.Sprintf("%d%%", p)
+	lb.SetText(s)
+	lb.SetToolTipText(s)
 }

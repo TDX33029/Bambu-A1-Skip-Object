@@ -2,11 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>拓竹跳过对象工具(Go 版)</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f4f5f7; color: #222; }
-  header { background: #1f2430; color: #fff; padding: 10px 16px; font-size: 15px; display: flex; gap: 14px; align-items: center; }
+  header { background: #1f2430; color: #fff; padding: 10px 16px; font-size: 15px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   header b { color: #7fd88f; }
   main { max-width: 1180px; margin: 12px auto; padding: 0 12px; display: flex; flex-direction: column; gap: 10px; }
   section { background: #fff; border-radius: 10px; padding: 12px 14px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
@@ -20,18 +21,20 @@
   button.danger { background: #c0392b; }
   button.go { background: #1e8e3e; font-weight: 600; }
   .stat { display: flex; flex-wrap: wrap; gap: 6px 22px; }
+  .stat span { min-width: 0; }
   .stat span.k { color: #888; font-size: 13px; margin-right: 4px; }
-  .stat span.v { font-weight: 600; }
-  .cols { display: flex; gap: 12px; align-items: stretch; }
-  .imgbox { width: 430px; flex: 0 0 430px; }
-  canvas { background: #0a0a0a; border: 1px solid #444; border-radius: 6px; width: 428px; }
-  .objlist { flex: 1; max-height: 470px; overflow-y: auto; border: 1px solid #e2e2e2; border-radius: 6px; padding: 4px 8px; }
-  .objlist label { display: block; padding: 3px 2px; border-bottom: 1px dashed #eee; cursor: pointer; }
+  .stat span.v { font-weight: 600; overflow-wrap: anywhere; }
+  .cols { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .imgbox { flex: 1 1 340px; max-width: 520px; min-width: 260px; }
+  canvas { background: #0a0a0a; border: 1px solid #444; border-radius: 6px; width: 100%; height: auto; display: block; }
+  .objlist { flex: 1 1 320px; min-width: 260px; max-height: 470px; overflow-y: auto; border: 1px solid #e2e2e2; border-radius: 6px; padding: 4px 8px; }
+  .objlist label { display: block; padding: 3px 2px; border-bottom: 1px dashed #eee; cursor: pointer; overflow-wrap: anywhere; }
   .objlist label.sel { background: #e8f7ee; }
   #log { background: #101410; color: #9f9; font-family: Consolas, monospace; font-size: 12px;
-         height: 150px; overflow-y: auto; padding: 8px; white-space: pre-wrap; border-radius: 6px; }
+         height: 170px; overflow-y: auto; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 6px; }
   .hint { color: #999; font-size: 12px; }
   .ok { color: #1e8e3e; } .bad { color: #c0392b; }
+  #ack { font-size: 13px; color: #555; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -40,12 +43,12 @@
 
 <section>
   <h2>1. 连接</h2>
-  <div class="row" id="credInfo" class="hint"></div>
+  <div class="row hint" id="credInfo"></div>
   <div class="row" style="margin-top:6px">
     <label class="dim"><input type="radio" name="mode" value="cloud" checked> 云端</label>
-    <select id="snSel" style="min-width:220px"></select>
+    <select id="snSel" style="min-width:200px"></select>
     <label class="dim"><input type="radio" name="mode" value="lan"> 局域网</label>
-    <span class="dim">IP</span><input id="ip" size="14" placeholder="192.168.x.x">
+    <span class="dim">IP</span><input id="ip" size="12" placeholder="192.168.x.x">
     <span class="dim">访问码</span><input id="code" size="9" type="password">
     <button id="btnConn" onclick="toggleConn()">连接</button>
     <span id="connState" class="hint"></span>
@@ -56,12 +59,13 @@
   <h2>2. 打印状态</h2>
   <div class="stat">
     <span><span class="k">状态</span><span class="v" id="s_state">-</span></span>
-    <span><span class="k">任务</span><span class="v" id="s_task">-</span></span>
+    <span><span class="k">任务</span><span class="v" id="s_task" title="">-</span></span>
     <span><span class="k">层号</span><span class="v" id="s_layer">-</span></span>
     <span><span class="k">进度</span><span class="v" id="s_pct">-</span></span>
     <span><span class="k">已跳过</span><span class="v" id="s_skip">-</span></span>
     <span><span class="k">任务ID</span><span class="v" id="s_tid">-</span></span>
   </div>
+  <div id="s_hms" class="bad" style="margin-top:4px"></div>
 </section>
 
 <section>
@@ -70,7 +74,7 @@
     <button id="btnFetch" onclick="doFetch()" disabled>从云端任务获取</button>
     <label class="ghost" style="padding:6px 10px;border-radius:6px;background:#e2e8f0;cursor:pointer">
       打开切片 3mf…<input type="file" id="f3mf" accept=".3mf" style="display:none"></label>
-    <select id="plateSel" style="min-width:260px" onchange="renderPlate()"></select>
+    <select id="plateSel" style="min-width:220px" onchange="renderPlate()"></select>
     <button class="ghost" onclick="setAll(true)">全选</button>
     <button class="ghost" onclick="setAll(false)">清空</button>
     <label class="dim"><input type="radio" name="view" value="pick" checked onchange="showImg()"> 选择视图(可点击)</label>
@@ -78,7 +82,7 @@
   </div>
   <div class="cols" style="margin-top:8px">
     <div class="imgbox">
-      <canvas id="plate" width="428" height="428"></canvas>
+      <canvas id="plate" width="512" height="512"></canvas>
       <div class="hint">黑色区域为空白热床;点击零件切换选中(绿圈),与右侧列表联动</div>
     </div>
     <div class="objlist" id="objlist"><div class="hint" style="padding:8px">尚未加载零件列表</div></div>
@@ -89,13 +93,13 @@
   <h2>4. 发送跳过命令</h2>
   <div class="row">
     <span class="dim">手动 ID(逗号分隔)</span>
-    <input id="manual" size="20" placeholder="如 197,175">
-    <label class="dim"><input type="checkbox" id="legacy"> 旧协议(Studio 格式)</label>
+    <input id="manual" size="18" placeholder="如 197,175">
     <span style="flex:1"></span>
     <button class="ghost" id="btnManual" onclick="sendManual()" disabled>跳过手动输入</button>
     <button class="go" id="btnSkip" onclick="sendSelected()" disabled>跳过选中零件</button>
   </div>
-  <div class="hint" style="margin-top:6px">请确认打印进行中(RUNNING/暂停);跳过已开始的零件不可撤销。</div>
+  <div id="ack" style="margin-top:6px">打印机应答: -</div>
+  <div class="hint" style="margin-top:4px">请确认打印进行中(RUNNING/暂停);跳过已开始的零件不可撤销。</div>
 </section>
 
 <section>
@@ -106,11 +110,12 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let state = {connected:false, creds:null, report:null, plates:[]};
+let state = {connected:false, creds:null, report:null, plates:[], skipped:[], hms:[], last_ack:null};
 let selected = new Set();          // identify_id -> 选中
 let curPlateIdx = null;
 let lastSeq = 0, reported = new Set();
-let lastClick = {};                // iid -> {x,y}
+let lastClick = {};                // iid -> {x,y}(canvas 内部坐标)
+let platesVersion = 0;
 
 async function post(url, body) {
   const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
@@ -138,6 +143,7 @@ async function pollLogs() {
 }
 
 function setText(el, v) { const s = String(v); if (el.textContent !== s) el.textContent = s; }
+function setTextT(el, v) { setText(el, v); el.title = String(v); }
 
 function render() {
   $('ver').textContent = 'v' + state.version;
@@ -157,32 +163,38 @@ function render() {
     const msg = `<span class="bad">凭证: ${esc((c && c.message) || '不可用')} → 可用局域网模式</span>`;
     if ($('credInfo')._h !== msg) { $('credInfo').innerHTML = msg; $('credInfo')._h = msg; }
   }
-  // 连接状态(变化才写,避免打断自动化/减少重排)
   setText($('connState'), state.connected ? `已连接(${state.mode})目标: ${state.sn || '-'}` : '未连接');
   const connTxt = state.connected ? '断开' : '连接';
   if ($('btnConn').textContent !== connTxt) {
     $('btnConn').textContent = connTxt;
     $('btnConn').className = state.connected ? 'danger' : '';
   }
-  // 状态
   const r = state.report || {};
   const g = r.gcode_state || '';
   setText($('s_state'), STATE_CN[g] || g || '-');
-  setText($('s_task'), (r.subtask_name || '-'));
+  setTextT($('s_task'), (r.subtask_name || '-'));
   setText($('s_layer'), fmtN(r.layer_num) + '/' + fmtN(r.total_layer_num));
   const pct = parseInt(r.print_percent);
-  setText($('s_pct'), (pct >= 0 && pct <= 100) ? pct + '%' : '-');
-  setText($('s_skip'), r.skip_objects || '-');
+  setText($('s_pct'), (pct >= 0 && pct <= 100) ? pct + '%' : (r.mc_percent !== undefined ? r.mc_percent + '%' : '-'));
+  const sk = (state.skipped && state.skipped.length) ? state.skipped.join(',') : (r.skip_objects || '-');
+  setText($('s_skip'), sk);
   setText($('s_tid'), r.task_id || '-');
-  // 按钮
+  const hmsEl = $('s_hms');
+  const hmsTxt = (state.hms && state.hms.length) ? '⚠ ' + state.hms.join(';') : '';
+  if (hmsEl.textContent !== hmsTxt) hmsEl.textContent = hmsTxt;
+  if (state.last_ack) $('ack').textContent = '打印机应答: ' + (state.last_ack.summary || '');
   const printing = g === 'RUNNING' || g === 'PAUSE';
   const wantFetch = !!(r.task_id && c && c.ok);
   if ($('btnFetch').disabled !== !wantFetch) $('btnFetch').disabled = !wantFetch;
   if ($('btnSkip').disabled !== !printing) $('btnSkip').disabled = !printing;
   if ($('btnManual').disabled !== !printing) $('btnManual').disabled = !printing;
-  // 零件
-  if (JSON.stringify(state.plates) !== render._pj) {
-    render._pj = JSON.stringify(state.plates);
+
+  // 已跳过(打印机 s_obj 优先)
+  (state.skipped || []).forEach(id => reported.add(id));
+  const pj = JSON.stringify(state.plates);
+  if (pj !== render._pj) {
+    render._pj = pj;
+    platesVersion++;
     state.plates.forEach(p => p.objects.forEach(o => { if (o.skipped) reported.add(o.identify_id); }));
     const ps = $('plateSel');
     ps.innerHTML = state.plates.map((p, i) =>
@@ -202,15 +214,16 @@ function renderPlate() {
   if (!pl) { box.innerHTML = ''; clearCanvas(); return; }
   box.innerHTML = pl.objects.map(o => {
     if (o.skipped) reported.add(o.identify_id);
-    const dis = o.skipped ? 'disabled' : '';
-    return `<label data-iid="${o.identify_id}" class="${o.skipped ? 'sel' : ''}">
-      <input type="checkbox" data-iid="${o.identify_id}" ${o.skipped ? 'checked disabled' : ''}
-             onchange="onListCheck(${o.identify_id}, this.checked)"> ${esc(o.label || objLabel(o))}</label>`;
+    const skipped = o.skipped || reported.has(o.identify_id);
+    return `<label data-iid="${o.identify_id}" class="${skipped ? 'sel' : ''}">
+      <input type="checkbox" data-iid="${o.identify_id}" ${skipped ? 'checked disabled' : ''}
+             onchange="onListCheck(${o.identify_id}, this.checked)"> ${esc(objLabel(o))}</label>`;
   }).join('');
   showImg();
 }
 function objLabel(o) {
-  return `#${o.identify_id}  ${o.name}` + (o.skipped ? '  [已跳过]' : '');
+  const skipped = o.skipped || reported.has(o.identify_id);
+  return `#${o.identify_id}  ${o.name}` + (skipped ? '  [已跳过]' : '');
 }
 function onListCheck(iid, checked) {
   if (checked) selected.add(iid); else selected.delete(iid);
@@ -223,7 +236,8 @@ function onListCheck(iid, checked) {
 function setAll(v) {
   const pl = state.plates[curPlateIdx]; if (!pl) return;
   for (const o of pl.objects) {
-    if (o.skipped) continue;
+    const skipped = o.skipped || reported.has(o.identify_id);
+    if (skipped) continue;
     if (v) selected.add(o.identify_id); else selected.delete(o.identify_id);
     const cb = document.querySelector(`.objlist input[data-iid="${o.identify_id}"]`);
     if (cb) cb.checked = v;
@@ -237,60 +251,67 @@ function setAll(v) {
 const cv = $('plate'), ctx = cv.getContext('2d', {willReadFrequently: true});
 let imgCache = {};
 
-function clearCanvas() { ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0, 0, cv.width, cv.height); }
-
+function clearCanvas() {
+  ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0, 0, cv.width, cv.height);
+}
+function currentView() {
+  const pl = state.plates[curPlateIdx];
+  let k = document.querySelector('input[name=view]:checked').value;
+  if (!pl) return k;
+  if (k === 'pick' && !pl.has_pick) k = 'top';
+  if (k === 'top' && !pl.has_top) k = 'pick';
+  return k;
+}
 function showImg() {
   const pl = state.plates[curPlateIdx];
   clearCanvas();
   if (!pl) return;
-  const view = document.querySelector('input[name=view]:checked').value;
-  let k = view;
-  if (k === 'pick' && !pl.has_pick) k = 'top';
+  const k = currentView();
   if ((k === 'pick' && !pl.has_pick) || (k === 'top' && !pl.has_top)) {
     ctx.fillStyle = '#888'; ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
     ctx.fillText('无俯视图,可直接在右侧列表勾选', cv.width/2, cv.height/2);
     return;
   }
-  const key = curPlateIdx + ':' + k;
+  const key = platesVersion + ':' + curPlateIdx + ':' + k;
+  if (imgCache[key]) { drawToFit(imgCache[key]); refreshMarks(); return; }
   const img = new Image();
-  img.onload = () => { imgCache[curPlateIdx + ':' + k] = img; drawToFit(img); refreshMarks(); };
+  img.onload = () => {
+    imgCache[key] = img;
+    // 画布内部分辨率跟随图片,保证点击坐标与像素一一对应
+    cv.width = img.width; cv.height = img.height;
+    drawToFit(img); refreshMarks();
+  };
   img.onerror = () => { ctx.fillStyle = '#888'; ctx.fillText('图片加载失败', cv.width/2, cv.height/2); };
-  img.src = `/api/img?i=${pl.index}&k=${k}&v=${curPlateIdx}`;
+  img.src = `/api/img?i=${pl.index}&k=${k}&v=${platesVersion}`;
 }
 function drawToFit(img) {
-  const s = Math.min(cv.width / img.width, cv.height / img.height, 1);
-  ctx.imageSmoothingEnabled = s < 1;
-  const w = img.width * s, h = img.height * s;
-  ctx.drawImage(img, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
+  if (cv.width !== img.width || cv.height !== img.height) { cv.width = img.width; cv.height = img.height; }
+  ctx.drawImage(img, 0, 0);
 }
 function refreshMarks() {
-  // 重绘底图 + 标记
   const pl = state.plates[curPlateIdx]; if (!pl) return;
-  const view = document.querySelector('input[name=view]:checked').value;
-  let k = view;
-  if (k === 'pick' && !pl.has_pick) k = 'top';
-  const img = imgCache[curPlateIdx + ':' + k];
+  const img = imgCache[platesVersion + ':' + curPlateIdx + ':' + currentView()];
   if (img) drawToFit(img); else return;
-  ctx.lineWidth = 3; ctx.font = 'bold 13px sans-serif';
+  ctx.lineWidth = Math.max(2, cv.width / 200); ctx.font = `bold ${Math.max(12, cv.width/40)}px sans-serif`;
   for (const [iid, pos] of Object.entries(lastClick)) {
     if (!selected.has(Number(iid))) continue;
     ctx.strokeStyle = '#00e676';
-    ctx.beginPath(); ctx.arc(pos.x, pos.y, 16, 0, Math.PI * 2); ctx.stroke();
-    ctx.fillStyle = '#00e676'; ctx.fillText('✓', pos.x - 5, pos.y + 5);
+    ctx.beginPath(); ctx.arc(pos.x, pos.y, cv.width/32, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#00e676'; ctx.textAlign = 'center'; ctx.fillText('✓', pos.x, pos.y + cv.width/100);
   }
 }
 cv.addEventListener('click', ev => {
   const pl = state.plates[curPlateIdx]; if (!pl) return;
   const rect = cv.getBoundingClientRect();
-  const x = Math.floor(ev.clientX - rect.left), y = Math.floor(ev.clientY - rect.top);
-  // 读点击像素;零件中心常有孔(黑),向四周螺旋搜索最近的有效遮罩色
+  // CSS 显示尺寸可能被缩放,必须换算回 canvas 内部分辨率
+  const x = Math.floor((ev.clientX - rect.left) * cv.width / rect.width);
+  const y = Math.floor((ev.clientY - rect.top) * cv.height / rect.height);
   let iid = pxToId(x, y);
   if (!pl.objects.some(o => o.identify_id === iid || o.object_id === iid)) {
-    const near = nearestMaskId(x, y, pl);
-    if (near) iid = near;
+    iid = nearestMaskId(x, y, pl);
   }
   const obj = pl.objects.find(o => o.identify_id === iid || o.object_id === iid);
-  if (!obj || obj.skipped) return;                  // 空白/已跳过
+  if (!obj || obj.skipped || reported.has(iid)) return;
   selected.has(iid) ? selected.delete(iid) : selected.add(iid);
   lastClick[iid] = {x, y};
   const cb = document.querySelector(`.objlist input[data-iid="${iid}"]`);
@@ -299,16 +320,17 @@ cv.addEventListener('click', ev => {
   if (lb) lb.classList.toggle('sel', selected.has(iid));
   refreshMarks();
 });
+window.addEventListener('resize', () => refreshMarks());
+
 function pxToId(x, y) {
   if (x < 0 || y < 0 || x >= cv.width || y >= cv.height) return 0;
   const d = ctx.getImageData(x, y, 1, 1).data;
-  return d[0] + d[1] * 256 + d[2] * 65536;   // 遮罩颜色反解(黑=0 未命中)
+  return d[0] + d[1] * 256 + d[2] * 65536;
 }
 function nearestMaskId(x, y, pl) {
-  // 在半径 60px 内找最近的有效零件色像素(命中零件中心孔等镂空区域)
   const valid = new Set();
   for (const o of pl.objects) { valid.add(o.identify_id); valid.add(o.object_id); }
-  for (let r = 4; r <= 60; r += 4) {
+  for (let r = 4; r <= cv.width / 8; r += 4) {
     let best = null, bestD = 1e9;
     for (let a = 0; a < 360; a += 6) {
       const nx = x + Math.round(r * Math.cos(a * Math.PI / 180));
@@ -347,18 +369,21 @@ $('f3mf').addEventListener('change', async ev => {
 });
 async function sendSelected() {
   const pl = state.plates[curPlateIdx];
-  const ids = [...selected].filter(iid => !(pl && pl.objects.find(o => o.identify_id === iid && o.skipped)));
+  const ids = [...selected].filter(iid => {
+    const o = pl && pl.objects.find(x => x.identify_id === iid);
+    return !(o && (o.skipped || reported.has(iid)));
+  });
   if (!ids.length) return alert('请先勾选/点选要跳过的零件');
   if (!confirm(`确认跳过零件: ${ids.join(', ')}?\n该操作不可撤销。`)) return;
-  try { await post('/api/skip', {ids, legacy: $('legacy').checked}); }
-  catch(e) { alert('发送失败: ' + e.message); }
+  try { await post('/api/skip', {ids}); }
+  catch(e) { alert('打印机未接受: ' + e.message); }
 }
 async function sendManual() {
   const ids = $('manual').value.split(/[,\s]+/).map(Number).filter(n => n > 0);
   if (!ids.length) return alert('请输入对象 ID');
   if (!confirm(`确认跳过零件: ${ids.join(', ')}?\n该操作不可撤销。`)) return;
-  try { await post('/api/skip', {ids, legacy: $('legacy').checked}); }
-  catch(e) { alert('发送失败: ' + e.message); }
+  try { await post('/api/skip', {ids}); }
+  catch(e) { alert('打印机未接受: ' + e.message); }
 }
 
 const STATE_CN = {IDLE:'空闲', RUNNING:'打印中', PAUSE:'已暂停', FINISH:'已完成',

@@ -97,16 +97,24 @@ func handleState(w http.ResponseWriter, _ *http.Request) {
 		st["mode"] = p.Mode
 		st["sn"] = sn
 		st["report"] = report
+		st["skipped"] = skippedIDList(report)
+		st["hms"] = HMSNotices(report)
+		if ack, ok := p.LastAck(); ok {
+			st["last_ack"] = map[string]any{
+				"command": ack.Command, "seq": ack.Seq, "err_code": ack.ErrCode,
+				"result": ack.Result, "reason": ack.Reason, "summary": ackSummary(ack),
+			}
+		}
 	} else {
 		st["connected"] = false
 	}
 	plates := make([]map[string]any, 0, len(app.plates))
 	for _, pl := range app.plates {
 		plates = append(plates, map[string]any{
-			"index":   pl.Index,
-			"name":    pl.Name,
-			"source":  pl.Source,
-			"objects": pl.Objects,
+			"index":    pl.Index,
+			"name":     pl.Name,
+			"source":   pl.Source,
+			"objects":  pl.Objects,
 			"has_pick": pl.HasPick,
 			"has_top":  pl.HasTop,
 		})
@@ -224,7 +232,7 @@ func handleFetch(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "尚未收到打印机 report", 400)
 		return
 	}
-	taskID := asString(report["task_id"])
+	taskID := validTaskID(report)
 	if taskID == "" {
 		http.Error(w, "report 中没有任务 ID(需云端任务;本地 SD 打印请上传切片 3mf)", 400)
 		return
@@ -282,8 +290,7 @@ func handleUpload3mf(w http.ResponseWriter, r *http.Request) {
 
 func handleSkip(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs    []int `json:"ids"`
-		Legacy bool  `json:"legacy"`
+		IDs []int `json:"ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -296,11 +303,19 @@ func handleSkip(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "未连接打印机", 400)
 		return
 	}
-	if err := p.SkipObjects(req.IDs, req.Legacy); err != nil {
-		app.SetError("发送失败: " + err.Error())
+	res, err := p.SkipObjects(req.IDs)
+	if err != nil {
+		app.SetError("未发送: " + err.Error())
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	if !res.Accepted {
+		msg := fmt.Sprintf("打印机未接受(%s):%s", res.Variant, res.Note)
+		app.SetError(msg)
+		http.Error(w, msg, 409)
+		return
+	}
+	app.AddLog("[+] 已确认跳过 %v(%s)", res.IDs, res.Note)
 	w.WriteHeader(200)
 }
 
