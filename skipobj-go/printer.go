@@ -21,6 +21,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,9 +35,62 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// TLS 自签证书不校验(Bambu 打印机/云 broker 均为自签链)
-func mustInsecureTLS() *tls.Config {
-	return &tls.Config{InsecureSkipVerify: true}
+// TLS 自签证书不校验(Bambu 打印机/云 broker 均为自签链)。
+// serverName 用于「直连 IP + SNI」:代理 Fake-IP 模式下真实 IP 与域名分离,
+// 不显式指定 SNI 时部分节点会拒绝握手。
+func mustInsecureTLS(serverName ...string) *tls.Config {
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	if len(serverName) > 0 {
+		cfg.ServerName = serverName[0]
+	}
+	return cfg
+}
+
+// 代理软件(Clash/Mihomo TUN + Fake-IP)的常见保留段
+func isFakeIP(ip net.IP) bool {
+	for _, cidr := range []string{"198.18.0.0/15", "198.19.0.0/16", "240.0.0.0/4"} {
+		_, n, err := net.ParseCIDR(cidr)
+		if err == nil && n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRealIP 用 DNS-over-HTTPS 拿真实 A 记录,绕过系统 DNS 被代理劫持。
+// 失败返回空串(不影响正常连接流程)。
+func resolveRealIP(host string) string {
+	type answer struct {
+		Type int    `json:"type"`
+		Data string `json:"data"`
+	}
+	type dohResp struct {
+		Status int      `json:"Status"`
+		Answer []answer `json:"Answer"`
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	for _, base := range []string{"https://223.5.5.5/resolve", "https://dns.alidns.com/resolve"} {
+		u := base + "?name=" + host + "&type=A"
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		var dr dohResp
+		if json.Unmarshal(body, &dr) != nil || dr.Status != 0 {
+			continue
+		}
+		for _, a := range dr.Answer {
+			if a.Type == 1 && net.ParseIP(a.Data) != nil && !isFakeIP(net.ParseIP(a.Data)) {
+				return a.Data
+			}
+		}
+	}
+	return ""
 }
 
 const seqStart = 2001
@@ -163,17 +220,48 @@ func (p *Printer) SetupLAN(host, accessCode, sn string) {
 
 // Connect 建立连接;OnConnect 回调(paho 网络线程)中订阅并上报成功。
 func (p *Printer) Connect() error {
+	// 云端/局域网统一走 8883;若系统 DNS 被代理 Fake-IP 劫持,优先直连真实 IP
+	// (TLS SNI 仍用原域名),失败再由 paho 回退到主机名(走代理)。
+	brokers := []string{"tcps://" + p.Host + ":8883"}
+	forceDirect := os.Getenv("BBL_FORCE_DIRECT") == "1"
+	fakeIP := ""
+	if ips, err := net.LookupIP(p.Host); err == nil {
+		for _, ip := range ips {
+			if isFakeIP(ip) {
+				fakeIP = ip.String()
+				break
+			}
+		}
+	}
+	if p.Mode == "cloud" && (fakeIP != "" || forceDirect) {
+		if realIP := resolveRealIP(p.Host); realIP != "" {
+			direct := "tcps://" + realIP + ":8883"
+			if forceDirect {
+				brokers = []string{direct}
+			} else {
+				brokers = append([]string{direct}, brokers...)
+			}
+			p.logf("[!] %s 被解析为代理 Fake-IP(%s),优先直连 %s(SNI=%s)",
+				p.Host, fakeIP, realIP, p.Host)
+		} else if fakeIP != "" {
+			p.logf("[!] %s 解析为 Fake-IP(%s),且 DoH 未取到真实 IP,将走代理连接",
+				p.Host, fakeIP)
+		}
+	}
+
 	opts := mqtt.NewClientOptions().
-		AddBroker("tcps://" + p.Host + ":8883").
 		SetClientID(newUUID()).
 		SetUsername(p.Username).
 		SetPassword(p.Password).
-		SetTLSConfig(mustInsecureTLS()).
+		SetTLSConfig(mustInsecureTLS(p.Host)).
 		SetAutoReconnect(false).
 		SetConnectRetry(false).
-		SetConnectTimeout(15 * time.Second).
+		SetConnectTimeout(9 * time.Second).
 		SetKeepAlive(60 * time.Second).
 		SetOrderMatters(true)
+	for _, b := range brokers {
+		opts.AddBroker(b)
+	}
 
 	opts.OnConnect = func(c mqtt.Client) {
 		p.mu.Lock()
@@ -201,7 +289,7 @@ func (p *Printer) Connect() error {
 	c := mqtt.NewClient(opts)
 	tok := c.Connect()
 	if !tok.WaitTimeout(25 * time.Second) {
-		return errors.New("连接超时(25 秒未完成 MQTT 握手;若开着代理请把 *.bambulab.com 加入直连规则,或改用局域网模式)")
+		return errors.New("连接超时(MQTT 握手未完成;若开着代理,请把 *.bambulab.com 加入直连规则,或设置 BBL_FORCE_DIRECT=1 强制直连,或改用局域网模式)")
 	}
 	if err := tok.Error(); err != nil {
 		return fmt.Errorf("MQTT 认证被拒绝: %v", err)
